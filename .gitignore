@@ -18,6 +18,12 @@ htmlcov/
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.p8
+service-account*.json
 
 # IDE/editor and OS files
 .idea/
