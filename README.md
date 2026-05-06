@@ -55,6 +55,7 @@
 
 ```bash
 TELEGRAM_BOT_TOKEN=텔레그램_BotFather에서_받은_토큰
+ALLOWED_TELEGRAM_CHAT_IDS=허용할_Telegram_chat_id
 JOBIS_PROVIDER=gemini
 GEMINI_API_KEY=Google_AI_Studio에서_받은_키
 GEMINI_MODEL=gemini-3.1-flash-lite-preview
@@ -71,6 +72,9 @@ SEND_RESUME_NOTICE_ON_START=true
 SEND_PROGRESS_NOTICE_ON_START=true
 DROP_PENDING_UPDATES_ON_START=true
 ```
+
+`ALLOWED_TELEGRAM_CHAT_IDS`는 쉼표로 여러 개를 넣을 수 있습니다. 예: `123456789,987654321`
+이 값이 비어 있으면 봇이 실행되지 않습니다.
 
 의존성을 설치합니다.
 
@@ -191,6 +195,7 @@ uv run python bot.py
 ## 서버 재시작 정책
 
 - 서버가 꺼져 있는 동안 들어온 Telegram 메시지는 무시합니다.
+- `.env`의 `ALLOWED_TELEGRAM_CHAT_IDS`에 있는 사용자만 봇을 사용할 수 있습니다.
 - 진행 중인 면접이 있으면 서버 시작 시 `/continue`, `/end` 안내를 보냅니다.
 - 진행 중인 면접은 없지만 저장된 입력 상태가 있으면 현재 상태와 다음 추천 명령어를 보냅니다.
 - 아무 데이터도 없는 첫 상태에서는 조용히 대기합니다.

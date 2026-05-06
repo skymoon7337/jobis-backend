@@ -8,6 +8,7 @@ from typing import Any, TypeVar
 from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -81,6 +82,42 @@ def get_chat_id(update: Update) -> int:
     if chat is None:
         raise RuntimeError("Telegram chat 정보를 찾지 못했습니다.")
     return chat.id
+
+
+def parse_allowed_chat_ids() -> set[int]:
+    raw_ids = os.getenv("ALLOWED_TELEGRAM_CHAT_IDS", "")
+    chat_ids: set[int] = set()
+
+    for raw_id in raw_ids.split(","):
+        raw_id = raw_id.strip()
+        if not raw_id:
+            continue
+        try:
+            chat_ids.add(int(raw_id))
+        except ValueError as exc:
+            raise RuntimeError(
+                "ALLOWED_TELEGRAM_CHAT_IDS는 쉼표로 구분된 숫자 chat_id 목록이어야 합니다."
+            ) from exc
+
+    return chat_ids
+
+
+def get_allowed_chat_ids(context: ContextTypes.DEFAULT_TYPE) -> set[int]:
+    allowed_chat_ids = context.application.bot_data.get("allowed_chat_ids", set())
+    return set(allowed_chat_ids)
+
+
+async def reject_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    allowed_chat_ids = get_allowed_chat_ids(context)
+    if chat is not None and chat.id in allowed_chat_ids:
+        return
+
+    chat_id = chat.id if chat is not None else "unknown"
+    logging.warning("허용되지 않은 Telegram chat_id 접근을 차단했습니다: %s", chat_id)
+    if update.message:
+        await update.message.reply_text("이 jobis 봇은 허용된 사용자만 사용할 수 있습니다.")
+    raise ApplicationHandlerStop
 
 
 def get_session(update: Update) -> UserSession:
@@ -1337,11 +1374,15 @@ async def complete_interview(update: Update, session: UserSession) -> None:
 
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(BOT_COMMANDS)
+    allowed_chat_ids = set(application.bot_data.get("allowed_chat_ids", set()))
+
     if os.getenv("SEND_RESUME_NOTICE_ON_START", "true").lower() != "true":
         return
 
     sent_chat_ids: set[int] = set()
     for notice in get_active_interview_notices():
+        if notice["chat_id"] not in allowed_chat_ids:
+            continue
         try:
             sent_chat_ids.add(notice["chat_id"])
             await application.bot.send_message(
@@ -1355,6 +1396,8 @@ async def post_init(application: Application) -> None:
         return
 
     for notice in get_progress_notices():
+        if notice["chat_id"] not in allowed_chat_ids:
+            continue
         if notice["chat_id"] in sent_chat_ids:
             continue
         try:
@@ -1369,9 +1412,15 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     provider = os.getenv("JOBIS_PROVIDER", "gemini").lower()
+    allowed_chat_ids = parse_allowed_chat_ids()
 
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN이 없습니다. .env 파일에 추가해주세요.")
+
+    if not allowed_chat_ids:
+        raise RuntimeError(
+            "ALLOWED_TELEGRAM_CHAT_IDS가 없습니다. .env에 허용할 Telegram chat_id를 추가해주세요."
+        )
 
     if provider == "gemini" and not os.getenv("GEMINI_API_KEY"):
         raise RuntimeError("GEMINI_API_KEY가 없습니다. .env 파일에 추가해주세요.")
@@ -1380,6 +1429,8 @@ def main() -> None:
         raise RuntimeError("OPENAI_API_KEY가 없습니다. .env 파일에 추가해주세요.")
 
     application = Application.builder().token(token).post_init(post_init).build()
+    application.bot_data["allowed_chat_ids"] = allowed_chat_ids
+    application.add_handler(MessageHandler(filters.ALL, reject_unauthorized), group=-1)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("continue", continue_interview))
