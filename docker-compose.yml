@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: ${DB_USERNAME}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     ports:
-      - "${DB_PORT}:5432"
+정      - "127.0.0.1:${DB_PORT}:5432"
     volumes:
       - jobis_postgres_data:/var/lib/postgresql/data
 
