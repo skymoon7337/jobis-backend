@@ -716,7 +716,7 @@ def build_help_message() -> str:
         "/show_analyze - 저장된 통합 상세 분석 보기\n\n"
         "관리\n"
         "/end - 면접 종료\n"
-        "/reset - 전체 초기화"
+        "/reset - 입력 자료 초기화(면접 기록 유지)"
     )
 
 
@@ -758,7 +758,21 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat is not None:
         sessions.pop(chat.id, None)
         reset_user_context(chat.id)
-    await reply(update, "초기화했습니다. /start 로 다시 시작할 수 있어요.")
+    await reply(
+        update,
+        "입력 자료를 초기화했습니다.\n\n"
+        "삭제된 것\n"
+        "- 프로필\n"
+        "- 자소서\n"
+        "- GitHub 분석\n"
+        "- 공고\n"
+        "- 통합 분석\n\n"
+        "남아있는 것\n"
+        "- 지난 면접 기록\n"
+        "- 전체 피드백\n"
+        "- 약점 요약\n\n"
+        "다시 시작하려면 /start 를 입력하세요.",
+    )
 
 
 async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
