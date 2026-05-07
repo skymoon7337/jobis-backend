@@ -687,6 +687,8 @@ def build_start_message(session: UserSession) -> str:
         "3. 기술스택\n"
         "4. 프로젝트/GitHub\n"
         "5. 프로젝트/자소서\n\n"
+        "주의\n"
+        "자소서와 면접 답변은 Telegram, LLM API, 로컬 DB를 거칩니다. 민감정보는 입력하지 마세요.\n\n"
         f"{build_progress_message(session)}\n\n"
         "명령어 목록은 아래에 같이 보냈어요. 나중에는 /help 로 다시 볼 수 있습니다."
     )
