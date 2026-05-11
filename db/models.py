@@ -25,6 +25,22 @@ class TelegramUser(Base):
     )
 
     sessions: Mapped[list["InterviewSession"]] = relationship(back_populates="user")
+    job_postings: Mapped[list["JobPostingRecord"]] = relationship(back_populates="user")
+
+
+class JobPostingRecord(Base):
+    __tablename__ = "job_postings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    source_url: Mapped[str] = mapped_column(Text, default="")
+    raw_text: Mapped[str] = mapped_column(Text, default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    is_selected: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+    user: Mapped[TelegramUser] = relationship(back_populates="job_postings")
 
 
 class InterviewSession(Base):

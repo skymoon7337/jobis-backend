@@ -11,7 +11,7 @@
 - `/profile` 관심 직무, 경력, 학력, 기술스택 저장
 - `/resume` 자소서 텍스트 저장
 - `/github` GitHub 레포 URL 입력 후 README, 파일 구조, 주요 코드 기반 분석
-- `/job` 채용공고 URL 또는 본문 저장
+- `/job` 채용공고 추가, 목록 확인, 현재 공고 선택/삭제
 - `/analyze` 프로필, 자소서, GitHub, 공고를 묶어 통합 분석
 - 자료가 바뀌면 기존 통합 분석을 비우고 `/analyze` 재실행 안내
 
@@ -116,7 +116,7 @@ uv run python bot.py
 /profile 백엔드 주니어 개발자, 신입, 컴퓨터공학 전공, Java/Spring Boot, MySQL, Docker
 /resume 자소서 텍스트
 /github GitHub 레포 URL
-/job 공고 URL 또는 공고 본문
+/job add 공고 URL 또는 공고 본문
 /analyze
 /interview
 ```
@@ -144,7 +144,7 @@ uv run python bot.py
 - `/profile` 관심 직무, 경력, 학력, 기술스택 입력
 - `/resume` 자소서 텍스트 입력
 - `/github` GitHub 레포 분석 실행
-- `/job` 공고 URL 또는 본문 입력
+- `/job` 공고 추가/목록/선택/삭제
 - `/analyze` 입력 자료 통합 분석 실행
 
 ### 면접
@@ -155,6 +155,15 @@ uv run python bot.py
 - `/followup` 방금 답변 꼬리질문
 - `/another` 같은 분야 추가질문
 - `/end` 현재 면접 종료
+
+### 공고 관리
+
+- `/job` 저장된 공고 목록과 사용법 보기
+- `/job add` 다음 메시지로 공고 URL 또는 본문 추가
+- `/job add 공고본문` 공고 바로 추가
+- `/job show` 현재 선택된 공고 요약 보기
+- `/job select 2` 2번 공고를 현재 면접 기준으로 선택
+- `/job delete 2` 2번 공고 삭제
 
 ### 보기
 
@@ -187,7 +196,7 @@ jobis는 로컬 MVP지만, 입력한 자소서와 면접 답변이 다음 위치
 - 사용자 프로필
 - 자소서
 - GitHub URL과 분석 결과
-- 채용공고 본문
+- 채용공고 목록, 원본 링크, 요약, 현재 선택된 공고
 - 통합 분석 결과
 - 면접 세션 상태
 - 생성된 기본 질문과 보너스 질문

@@ -17,17 +17,22 @@ from telegram.ext import (
 
 from config import load_environment
 from db.repository import (
+    create_job_posting,
     create_interview_session,
+    delete_job_posting,
     get_active_interview_notices,
     get_active_interview_snapshot,
+    get_job_postings,
     get_progress_notices,
     get_latest_feedback_summary,
     get_recent_sessions,
     get_latest_weakness_summary,
+    get_selected_job_posting,
     load_user_session,
     reset_user_context,
     save_interview_question,
     save_interview_questions,
+    select_job_posting,
     save_interview_turn,
     update_interview_session,
     update_user_fields,
@@ -58,7 +63,7 @@ BOT_COMMANDS = [
     BotCommand("profile", "관심 직무/경력/학력/기술스택 입력"),
     BotCommand("resume", "자소서 텍스트 입력"),
     BotCommand("github", "GitHub 레포 분석 실행"),
-    BotCommand("job", "공고 URL 또는 본문 입력"),
+    BotCommand("job", "공고 추가/목록/선택/삭제"),
     BotCommand("analyze", "자소서/GitHub/공고 통합 분석 실행"),
     BotCommand("interview", "5문항 면접 시작"),
     BotCommand("continue", "진행 중이던 면접 이어하기"),
@@ -318,6 +323,55 @@ def split_tagged_sections(text: str, first_tag: str, second_tag: str) -> tuple[s
     if not match:
         return "", text.strip()
     return match.group(1).strip(), match.group(2).strip()
+
+
+def parse_job_summary(text: str) -> tuple[str, str]:
+    title, summary = split_tagged_sections(text, "TITLE", "SUMMARY")
+    title = title.splitlines()[0].strip() if title else "미상 - 채용공고"
+    summary = summary or text.strip()
+    return title[:200], format_for_telegram(summary)
+
+
+def parse_job_index(payload: str) -> int | None:
+    try:
+        return int(payload.strip())
+    except ValueError:
+        return None
+
+
+def format_job_menu(chat_id: int) -> str:
+    postings = get_job_postings(chat_id)
+    if not postings:
+        list_text = "저장된 공고가 없습니다."
+    else:
+        lines = []
+        for posting in postings:
+            mark_text = "✅ " if posting["is_selected"] else ""
+            index = posting["index"]
+            lines.append(f"{mark_text}[{index}] {posting['title']}")
+        list_text = "\n".join(lines)
+
+    return (
+        "공고 관리\n\n"
+        f"{list_text}\n\n"
+        "사용법\n"
+        "/job add - 공고 URL 또는 본문 추가\n"
+        "/job show - 현재 선택된 공고 요약 보기\n"
+        "/job select 번호 - 현재 면접 기준 공고 선택\n"
+        "/job delete 번호 - 저장된 공고 삭제\n\n"
+        "기존처럼 /job 뒤에 공고 본문이나 URL을 바로 붙여넣어도 추가됩니다."
+    )
+
+
+def format_job_detail(posting: dict[str, Any]) -> str:
+    source = f"\n출처\n{posting['source_url']}\n" if posting["source_url"] else ""
+    return (
+        "현재 선택된 공고\n\n"
+        f"[{posting['index']}] {posting['title']}\n"
+        f"{source}\n"
+        f"{posting['summary']}\n\n"
+        "다음 추천: /analyze"
+    ).strip()
 
 
 def extract_weakness_summary(feedback: str) -> str:
@@ -673,7 +727,7 @@ def build_start_message(session: UserSession) -> str:
         "1. /profile - 관심 직무, 경력, 학력, 기술스택 입력\n"
         "2. /resume - 자소서 입력\n"
         "3. /github - GitHub 레포 분석\n"
-        "4. /job - 공고 입력\n"
+        "4. /job - 공고 추가/목록/선택/삭제\n"
         "5. /analyze - 통합 분석\n"
         "6. /interview - 면접 시작\n\n"
         "면접 중 선택\n"
@@ -701,7 +755,7 @@ def build_help_message() -> str:
         "/profile - 관심 직무, 경력, 학력, 기술스택 입력\n"
         "/resume - 자소서 텍스트 입력\n"
         "/github - GitHub 레포 분석 실행\n"
-        "/job - 공고 URL 또는 본문 입력\n"
+        "/job - 공고 추가/목록/선택/삭제\n"
         "/analyze - 입력 자료 통합 분석 실행\n"
         "/interview - 5문항 면접 시작(CS/언어/기술스택/프로젝트)\n"
         "/continue - 진행 중이던 면접 이어하기\n"
@@ -894,8 +948,63 @@ async def set_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     payload = command_payload(update)
     if not payload:
-        session.awaiting = "job"
-        await reply(update, "공고 URL 또는 공고 본문을 보내주세요.")
+        await reply(update, format_job_menu(get_chat_id(update)))
+        return
+
+    action, _, rest = payload.partition(" ")
+    action = action.lower().strip()
+    rest = rest.strip()
+
+    if action == "add":
+        if not rest:
+            session.awaiting = "job_add"
+            await reply(update, "추가할 공고 URL 또는 공고 본문을 보내주세요.\n이미지 공고는 아직 자동 인식하지 않으니 텍스트로 옮겨서 보내주세요.")
+            return
+        await save_job(update, session, rest)
+        return
+
+    if action == "show":
+        selected = get_selected_job_posting(get_chat_id(update))
+        if not selected:
+            await reply(update, "현재 선택된 공고가 없습니다. /job add 로 공고를 먼저 추가해주세요.")
+            return
+        await reply(update, format_job_detail(selected))
+        return
+
+    if action == "select":
+        index = parse_job_index(rest)
+        if index is None:
+            await reply(update, "선택할 공고 번호를 입력해주세요. 예: /job select 2")
+            return
+        selected = select_job_posting(get_chat_id(update), index)
+        if not selected:
+            await reply(update, "해당 번호의 공고를 찾지 못했습니다. /job 으로 목록을 확인해주세요.")
+            return
+        session.job_posting = selected["raw_text"]
+        invalidate_analysis(session)
+        await reply(update, f"[{selected['index']}] {selected['title']} 공고를 현재 면접 기준으로 선택했습니다.\n\n다음 추천: /analyze")
+        return
+
+    if action == "delete":
+        index = parse_job_index(rest)
+        if index is None:
+            await reply(update, "삭제할 공고 번호를 입력해주세요. 예: /job delete 2")
+            return
+        deleted, was_selected = delete_job_posting(get_chat_id(update), index)
+        if not deleted:
+            await reply(update, "해당 번호의 공고를 찾지 못했습니다. /job 으로 목록을 확인해주세요.")
+            return
+        if was_selected:
+            session.job_posting = ""
+            invalidate_analysis(session)
+            await reply(
+                update,
+                f"[{deleted['index']}] {deleted['title']} 공고를 삭제했습니다.\n\n"
+                "삭제한 공고가 현재 선택된 공고였습니다.\n"
+                "다른 공고를 선택하려면 /job 으로 목록을 확인한 뒤 /job select 번호 를 입력하세요.",
+            )
+        else:
+            await reply(update, f"[{deleted['index']}] {deleted['title']} 공고를 삭제했습니다.")
         return
 
     await save_job(update, session, payload)
@@ -903,7 +1012,9 @@ async def set_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def save_job(update: Update, session: UserSession, text: str) -> None:
     session.awaiting = None
+    source_url = ""
     if text.startswith(("http://", "https://")):
+        source_url = text
         await reply(update, "공고 페이지를 읽어볼게요. 사이트가 막으면 본문 붙여넣기로 다시 받을 수 있어요.")
         try:
             text = await fetch_page_text(text)
@@ -912,14 +1023,38 @@ async def save_job(update: Update, session: UserSession, text: str) -> None:
                 update,
                 "이 URL은 자동으로 읽지 못했습니다.\n"
                 f"원인: {exc}\n\n"
-                "공고 본문을 복사해서 /job 뒤에 붙여넣거나, /job 입력 후 다음 메시지로 보내주세요.",
+                "공고 본문을 복사해서 /job add 뒤에 붙여넣거나, /job add 입력 후 다음 메시지로 보내주세요.",
             )
             return
 
+    await reply(update, "공고를 면접 준비용으로 요약해서 저장하는 중입니다.")
+    try:
+        job_result = await run_with_llm_retry(
+            update,
+            "공고 요약",
+            lambda: llm.summarize_job_posting(text),
+        )
+        title, summary = parse_job_summary(job_result)
+    except Exception as exc:
+        await reply(update, llm_failure_message("공고 요약", exc, "잠시 후 같은 공고로 /job add 를 다시 실행해주세요."))
+        return
+
     session.job_posting = text
     invalidate_analysis(session)
-    update_user_fields(get_chat_id(update), job_posting=text, analysis_summary="")
-    await reply(update, build_context_updated_message("공고 정보를", "공고가", session))
+    posting = create_job_posting(
+        get_chat_id(update),
+        title=title,
+        source_url=source_url,
+        raw_text=text,
+        summary=summary,
+    )
+    await reply(
+        update,
+        "공고를 저장하고 현재 면접 기준으로 선택했습니다.\n\n"
+        f"[{posting['index']}] {posting['title']}\n\n"
+        f"{posting['summary']}\n\n"
+        f"{build_progress_message(session)}",
+    )
 
 
 async def set_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1159,7 +1294,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await reply(update, build_context_updated_message("자소서를", "자소서가", session))
         return
 
-    if session.awaiting == "job":
+    if session.awaiting in {"job", "job_add"}:
         await save_job(update, session, text)
         return
 

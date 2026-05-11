@@ -2,7 +2,7 @@ from typing import Any
 
 from sqlalchemy import desc, func, or_, select
 
-from db.models import InterviewQuestionRecord, InterviewSession, InterviewTurnRecord, TelegramUser
+from db.models import JobPostingRecord, InterviewQuestionRecord, InterviewSession, InterviewTurnRecord, TelegramUser
 from db.session import SessionLocal
 from services.session import InterviewTurn, UserSession
 
@@ -45,16 +45,151 @@ def update_user_fields(chat_id: int, **fields: Any) -> None:
         db.commit()
 
 
+def create_job_posting(
+    chat_id: int,
+    *,
+    title: str,
+    source_url: str,
+    raw_text: str,
+    summary: str,
+) -> dict[str, Any]:
+    with SessionLocal() as db:
+        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        if not user:
+            user = TelegramUser(chat_id=chat_id)
+            db.add(user)
+            db.flush()
+
+        old_selected = db.scalars(
+            select(JobPostingRecord)
+            .where(JobPostingRecord.user_id == user.id)
+            .where(JobPostingRecord.is_selected.is_(True))
+        ).all()
+        for posting in old_selected:
+            posting.is_selected = False
+
+        posting = JobPostingRecord(
+            user_id=user.id,
+            title=title,
+            source_url=source_url,
+            raw_text=raw_text,
+            summary=summary,
+            is_selected=True,
+        )
+        user.job_posting = raw_text
+        user.analysis_summary = ""
+        db.add(posting)
+        db.commit()
+        db.refresh(posting)
+        postings = db.scalars(
+            select(JobPostingRecord)
+            .where(JobPostingRecord.user_id == user.id)
+            .order_by(JobPostingRecord.id)
+        ).all()
+        index = next((position for position, item in enumerate(postings, start=1) if item.id == posting.id), None)
+        return serialize_job_posting(posting, index=index)
+
+
+def get_job_postings(chat_id: int) -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        postings = db.scalars(
+            select(JobPostingRecord)
+            .join(TelegramUser, JobPostingRecord.user_id == TelegramUser.id)
+            .where(TelegramUser.chat_id == chat_id)
+            .order_by(JobPostingRecord.id)
+        ).all()
+        return [serialize_job_posting(posting, index=index) for index, posting in enumerate(postings, start=1)]
+
+
+def get_selected_job_posting(chat_id: int) -> dict[str, Any] | None:
+    postings = get_job_postings(chat_id)
+    for posting in postings:
+        if posting["is_selected"]:
+            return posting
+    return None
+
+
+def select_job_posting(chat_id: int, list_index: int) -> dict[str, Any] | None:
+    with SessionLocal() as db:
+        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        if not user:
+            return None
+
+        postings = db.scalars(
+            select(JobPostingRecord)
+            .where(JobPostingRecord.user_id == user.id)
+            .order_by(JobPostingRecord.id)
+        ).all()
+        if list_index < 1 or list_index > len(postings):
+            return None
+
+        selected = postings[list_index - 1]
+        for posting in postings:
+            posting.is_selected = posting.id == selected.id
+
+        user.job_posting = selected.raw_text
+        user.analysis_summary = ""
+        db.commit()
+        db.refresh(selected)
+        return serialize_job_posting(selected, index=list_index)
+
+
+def delete_job_posting(chat_id: int, list_index: int) -> tuple[dict[str, Any] | None, bool]:
+    with SessionLocal() as db:
+        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        if not user:
+            return None, False
+
+        postings = db.scalars(
+            select(JobPostingRecord)
+            .where(JobPostingRecord.user_id == user.id)
+            .order_by(JobPostingRecord.id)
+        ).all()
+        if list_index < 1 or list_index > len(postings):
+            return None, False
+
+        posting = postings[list_index - 1]
+        was_selected = bool(posting.is_selected)
+        deleted = serialize_job_posting(posting, index=list_index)
+        db.delete(posting)
+        if was_selected:
+            user.job_posting = ""
+            user.analysis_summary = ""
+        db.commit()
+        return deleted, was_selected
+
+
+def serialize_job_posting(posting: JobPostingRecord, index: int | None = None) -> dict[str, Any]:
+    return {
+        "id": posting.id,
+        "index": index,
+        "title": posting.title or f"공고 {posting.id}",
+        "source_url": posting.source_url or "",
+        "raw_text": posting.raw_text or "",
+        "summary": posting.summary or "",
+        "is_selected": bool(posting.is_selected),
+        "created_at": posting.created_at,
+    }
+
+
 def reset_user_context(chat_id: int) -> None:
-    update_user_fields(
-        chat_id,
-        profile="",
-        resume="",
-        github_url="",
-        github_summary="",
-        job_posting="",
-        analysis_summary="",
-    )
+    with SessionLocal() as db:
+        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        if not user:
+            return
+
+        user.profile = ""
+        user.resume = ""
+        user.github_url = ""
+        user.github_summary = ""
+        user.job_posting = ""
+        user.analysis_summary = ""
+
+        postings = db.scalars(select(JobPostingRecord).where(JobPostingRecord.user_id == user.id)).all()
+        for posting in postings:
+            db.delete(posting)
+
+        db.commit()
 
 
 def create_interview_session(chat_id: int) -> int:
