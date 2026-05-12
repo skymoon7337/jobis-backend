@@ -1,42 +1,49 @@
+import json
 from typing import Any
 
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import desc, func, select
 
-from db.models import JobPostingRecord, InterviewQuestionRecord, InterviewSession, InterviewTurnRecord, TelegramUser
+from db.models import (
+    GithubRepositoryRecord,
+    InterviewQuestionRecord,
+    InterviewSession,
+    InterviewTurnRecord,
+    JobPostingRecord,
+    User,
+)
 from db.session import SessionLocal
 from services.session import InterviewTurn, UserSession
 
 
-def get_or_create_user(chat_id: int) -> TelegramUser:
+def get_or_create_user(user_key: str) -> User:
     with SessionLocal() as db:
-        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        user = db.scalar(select(User).where(User.user_key == user_key))
         if user:
             return user
 
-        user = TelegramUser(chat_id=chat_id)
+        user = User(user_key=user_key)
         db.add(user)
         db.commit()
         db.refresh(user)
         return user
 
 
-def load_user_session(chat_id: int) -> UserSession:
-    user = get_or_create_user(chat_id)
+def load_user_session(user_key: str) -> UserSession:
+    user = get_or_create_user(user_key)
     return UserSession(
         profile=user.profile or "",
         resume=user.resume or "",
         github_url=user.github_url or "",
         github_summary=user.github_summary or "",
         job_posting=user.job_posting or "",
-        analysis_summary=user.analysis_summary or "",
     )
 
 
-def update_user_fields(chat_id: int, **fields: Any) -> None:
+def update_user_fields(user_key: str, **fields: Any) -> None:
     with SessionLocal() as db:
-        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        user = db.scalar(select(User).where(User.user_key == user_key))
         if not user:
-            user = TelegramUser(chat_id=chat_id)
+            user = User(user_key=user_key)
             db.add(user)
 
         for key, value in fields.items():
@@ -46,7 +53,7 @@ def update_user_fields(chat_id: int, **fields: Any) -> None:
 
 
 def create_job_posting(
-    chat_id: int,
+    user_key: str,
     *,
     title: str,
     source_url: str,
@@ -54,9 +61,9 @@ def create_job_posting(
     summary: str,
 ) -> dict[str, Any]:
     with SessionLocal() as db:
-        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        user = db.scalar(select(User).where(User.user_key == user_key))
         if not user:
-            user = TelegramUser(chat_id=chat_id)
+            user = User(user_key=user_key)
             db.add(user)
             db.flush()
 
@@ -77,7 +84,6 @@ def create_job_posting(
             is_selected=True,
         )
         user.job_posting = raw_text
-        user.analysis_summary = ""
         db.add(posting)
         db.commit()
         db.refresh(posting)
@@ -90,28 +96,35 @@ def create_job_posting(
         return serialize_job_posting(posting, index=index)
 
 
-def get_job_postings(chat_id: int) -> list[dict[str, Any]]:
+def get_job_postings(user_key: str) -> list[dict[str, Any]]:
     with SessionLocal() as db:
         postings = db.scalars(
             select(JobPostingRecord)
-            .join(TelegramUser, JobPostingRecord.user_id == TelegramUser.id)
-            .where(TelegramUser.chat_id == chat_id)
+            .join(User, JobPostingRecord.user_id == User.id)
+            .where(User.user_key == user_key)
             .order_by(JobPostingRecord.id)
         ).all()
         return [serialize_job_posting(posting, index=index) for index, posting in enumerate(postings, start=1)]
 
 
-def get_selected_job_posting(chat_id: int) -> dict[str, Any] | None:
-    postings = get_job_postings(chat_id)
+def get_selected_job_posting(user_key: str) -> dict[str, Any] | None:
+    postings = get_job_postings(user_key)
     for posting in postings:
         if posting["is_selected"]:
             return posting
     return None
 
 
-def select_job_posting(chat_id: int, list_index: int) -> dict[str, Any] | None:
+def get_job_posting_by_index(user_key: str, list_index: int) -> dict[str, Any] | None:
+    postings = get_job_postings(user_key)
+    if list_index < 1 or list_index > len(postings):
+        return None
+    return postings[list_index - 1]
+
+
+def select_job_posting(user_key: str, list_index: int) -> dict[str, Any] | None:
     with SessionLocal() as db:
-        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        user = db.scalar(select(User).where(User.user_key == user_key))
         if not user:
             return None
 
@@ -128,15 +141,14 @@ def select_job_posting(chat_id: int, list_index: int) -> dict[str, Any] | None:
             posting.is_selected = posting.id == selected.id
 
         user.job_posting = selected.raw_text
-        user.analysis_summary = ""
         db.commit()
         db.refresh(selected)
         return serialize_job_posting(selected, index=list_index)
 
 
-def delete_job_posting(chat_id: int, list_index: int) -> tuple[dict[str, Any] | None, bool]:
+def delete_job_posting(user_key: str, list_index: int) -> tuple[dict[str, Any] | None, bool]:
     with SessionLocal() as db:
-        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        user = db.scalar(select(User).where(User.user_key == user_key))
         if not user:
             return None, False
 
@@ -154,7 +166,6 @@ def delete_job_posting(chat_id: int, list_index: int) -> tuple[dict[str, Any] | 
         db.delete(posting)
         if was_selected:
             user.job_posting = ""
-            user.analysis_summary = ""
         db.commit()
         return deleted, was_selected
 
@@ -172,9 +183,124 @@ def serialize_job_posting(posting: JobPostingRecord, index: int | None = None) -
     }
 
 
-def reset_user_context(chat_id: int) -> None:
+def create_github_repository(
+    user_key: str,
+    *,
+    url: str,
+    title: str,
+    summary: str,
+) -> dict[str, Any]:
     with SessionLocal() as db:
-        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        user = db.scalar(select(User).where(User.user_key == user_key))
+        if not user:
+            user = User(user_key=user_key)
+            db.add(user)
+            db.flush()
+
+        repository = GithubRepositoryRecord(
+            user_id=user.id,
+            url=url,
+            title=title,
+            summary=summary,
+        )
+        user.github_url = url
+        user.github_summary = summary
+        db.add(repository)
+        db.commit()
+        db.refresh(repository)
+        repositories = db.scalars(
+            select(GithubRepositoryRecord)
+            .where(GithubRepositoryRecord.user_id == user.id)
+            .order_by(GithubRepositoryRecord.id)
+        ).all()
+        index = next((position for position, item in enumerate(repositories, start=1) if item.id == repository.id), None)
+        return serialize_github_repository(repository, index=index)
+
+
+def get_github_repositories(user_key: str) -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.user_key == user_key))
+        if not user:
+            return []
+
+        repositories = db.scalars(
+            select(GithubRepositoryRecord)
+            .where(GithubRepositoryRecord.user_id == user.id)
+            .order_by(GithubRepositoryRecord.id)
+        ).all()
+
+        if not repositories and user.github_summary:
+            repository = GithubRepositoryRecord(
+                user_id=user.id,
+                url=user.github_url or "",
+                title=github_repository_title(user.github_url or ""),
+                summary=user.github_summary or "",
+            )
+            db.add(repository)
+            db.commit()
+            repositories = [repository]
+
+        return [serialize_github_repository(repository, index=index) for index, repository in enumerate(repositories, start=1)]
+
+
+def get_github_repositories_by_indices(user_key: str, list_indices: list[int]) -> list[dict[str, Any]]:
+    repositories = get_github_repositories(user_key)
+    selected: list[dict[str, Any]] = []
+    for list_index in list_indices:
+        if list_index < 1 or list_index > len(repositories):
+            continue
+        selected.append(repositories[list_index - 1])
+    return selected
+
+
+def delete_github_repository(user_key: str, list_index: int) -> dict[str, Any] | None:
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.user_key == user_key))
+        if not user:
+            return None
+
+        repositories = db.scalars(
+            select(GithubRepositoryRecord)
+            .where(GithubRepositoryRecord.user_id == user.id)
+            .order_by(GithubRepositoryRecord.id)
+        ).all()
+        if list_index < 1 or list_index > len(repositories):
+            return None
+
+        repository = repositories[list_index - 1]
+        deleted = serialize_github_repository(repository, index=list_index)
+        db.delete(repository)
+        remaining = [item for item in repositories if item.id != repository.id]
+        if user.github_url == repository.url and user.github_summary == repository.summary:
+            latest = remaining[-1] if remaining else None
+            user.github_url = latest.url if latest else ""
+            user.github_summary = latest.summary if latest else ""
+        db.commit()
+        return deleted
+
+
+def serialize_github_repository(repository: GithubRepositoryRecord, index: int | None = None) -> dict[str, Any]:
+    return {
+        "id": repository.id,
+        "index": index,
+        "url": repository.url or "",
+        "title": repository.title or f"GitHub 저장소 {repository.id}",
+        "summary": repository.summary or "",
+        "created_at": repository.created_at,
+    }
+
+
+def github_repository_title(url: str) -> str:
+    cleaned = url.strip().rstrip("/")
+    parts = [part for part in cleaned.split("/") if part]
+    if len(parts) >= 2:
+        return "/".join(parts[-2:])
+    return cleaned or "GitHub 저장소"
+
+
+def reset_user_context(user_key: str) -> None:
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.user_key == user_key))
         if not user:
             return
 
@@ -183,20 +309,23 @@ def reset_user_context(chat_id: int) -> None:
         user.github_url = ""
         user.github_summary = ""
         user.job_posting = ""
-        user.analysis_summary = ""
 
         postings = db.scalars(select(JobPostingRecord).where(JobPostingRecord.user_id == user.id)).all()
         for posting in postings:
             db.delete(posting)
 
+        repositories = db.scalars(select(GithubRepositoryRecord).where(GithubRepositoryRecord.user_id == user.id)).all()
+        for repository in repositories:
+            db.delete(repository)
+
         db.commit()
 
 
-def create_interview_session(chat_id: int) -> int:
+def create_interview_session(user_key: str, context_snapshot: dict[str, Any] | None = None) -> int:
     with SessionLocal() as db:
-        user = db.scalar(select(TelegramUser).where(TelegramUser.chat_id == chat_id))
+        user = db.scalar(select(User).where(User.user_key == user_key))
         if not user:
-            user = TelegramUser(chat_id=chat_id)
+            user = User(user_key=user_key)
             db.add(user)
             db.flush()
 
@@ -210,11 +339,55 @@ def create_interview_session(chat_id: int) -> int:
             old_session.current_display_id = ""
             old_session.awaiting_choice = False
 
-        interview_session = InterviewSession(user_id=user.id, status="active")
+        snapshot = context_snapshot or {}
+        interview_session = InterviewSession(
+            user_id=user.id,
+            status="active",
+            context_profile=snapshot.get("profile", ""),
+            context_resume=snapshot.get("resume", ""),
+            context_job_title=snapshot.get("job_title", ""),
+            context_job_summary=snapshot.get("job_summary", ""),
+            context_github_repositories=json.dumps(
+                snapshot.get("github_repositories", []),
+                ensure_ascii=False,
+            ),
+        )
         db.add(interview_session)
         db.commit()
         db.refresh(interview_session)
         return interview_session.id
+
+
+def parse_json_list(value: str) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(value or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def serialize_interview_question(question: InterviewQuestionRecord) -> dict[str, Any]:
+    return {
+        "display_id": question.display_id or "",
+        "question_type": question.question_type or "",
+        "question": question.question or "",
+        "is_bonus": bool(question.is_bonus),
+        "bonus_type": question.bonus_type or "",
+    }
+
+
+def serialize_interview_turn(turn: InterviewTurnRecord) -> dict[str, Any]:
+    return {
+        "display_id": turn.display_id or "",
+        "question_type": turn.question_type or "",
+        "question": turn.question or "",
+        "answer": turn.answer or "",
+        "feedback": turn.feedback or "",
+        "is_bonus": bool(turn.is_bonus),
+        "bonus_type": turn.bonus_type or "",
+    }
 
 
 def update_interview_session(
@@ -245,12 +418,12 @@ def update_interview_session(
         db.commit()
 
 
-def get_active_interview_snapshot(chat_id: int) -> dict[str, Any] | None:
+def get_active_interview_snapshot(user_key: str) -> dict[str, Any] | None:
     with SessionLocal() as db:
         interview_session = db.scalar(
             select(InterviewSession)
-            .join(TelegramUser, InterviewSession.user_id == TelegramUser.id)
-            .where(TelegramUser.chat_id == chat_id)
+            .join(User, InterviewSession.user_id == User.id)
+            .where(User.user_key == user_key)
             .where(InterviewSession.status == "active")
             .order_by(desc(InterviewSession.created_at))
             .limit(1)
@@ -273,106 +446,9 @@ def get_active_interview_snapshot(chat_id: int) -> dict[str, Any] | None:
             "id": interview_session.id,
             "current_display_id": interview_session.current_display_id or "",
             "awaiting_choice": bool(interview_session.awaiting_choice),
-            "questions": [
-                {
-                    "display_id": question.display_id or "",
-                    "question_type": question.question_type or "",
-                    "question": question.question or "",
-                    "is_bonus": bool(question.is_bonus),
-                    "bonus_type": question.bonus_type or "",
-                }
-                for question in questions
-            ],
-            "turns": [
-                {
-                    "display_id": turn.display_id or "",
-                    "question_type": turn.question_type or "",
-                    "question": turn.question or "",
-                    "answer": turn.answer or "",
-                    "feedback": turn.feedback or "",
-                    "is_bonus": bool(turn.is_bonus),
-                    "bonus_type": turn.bonus_type or "",
-                }
-                for turn in turns
-            ],
+            "questions": [serialize_interview_question(question) for question in questions],
+            "turns": [serialize_interview_turn(turn) for turn in turns],
         }
-
-
-def get_active_interview_notices() -> list[dict[str, Any]]:
-    with SessionLocal() as db:
-        rows = db.execute(
-            select(
-                TelegramUser.chat_id,
-                InterviewSession.id,
-                InterviewSession.current_display_id,
-                InterviewSession.awaiting_choice,
-                func.count(InterviewTurnRecord.id).label("turn_count"),
-            )
-            .join(InterviewSession, InterviewSession.user_id == TelegramUser.id)
-            .outerjoin(InterviewTurnRecord, InterviewTurnRecord.session_id == InterviewSession.id)
-            .where(InterviewSession.status == "active")
-            .group_by(InterviewSession.id, TelegramUser.chat_id)
-            .order_by(desc(InterviewSession.created_at))
-        ).all()
-
-    notices: list[dict[str, Any]] = []
-    seen_chat_ids: set[int] = set()
-    for row in rows:
-        if row.chat_id in seen_chat_ids:
-            continue
-        seen_chat_ids.add(row.chat_id)
-        latest_turn = db.scalar(
-            select(InterviewTurnRecord)
-            .where(InterviewTurnRecord.session_id == row.id)
-            .order_by(desc(InterviewTurnRecord.id))
-            .limit(1)
-        )
-        notices.append(
-            {
-                "chat_id": row.chat_id,
-                "session_id": row.id,
-                "current_display_id": row.current_display_id or "",
-                "awaiting_choice": bool(row.awaiting_choice),
-                "turn_count": row.turn_count,
-                "last_display_id": latest_turn.display_id if latest_turn else "",
-                "last_question": latest_turn.question if latest_turn else "",
-            }
-        )
-
-    return notices
-
-
-def get_progress_notices() -> list[dict[str, Any]]:
-    active_user_ids = select(InterviewSession.user_id).where(InterviewSession.status == "active")
-
-    with SessionLocal() as db:
-        users = db.scalars(
-            select(TelegramUser)
-            .where(TelegramUser.id.not_in(active_user_ids))
-            .where(
-                or_(
-                    TelegramUser.profile != "",
-                    TelegramUser.resume != "",
-                    TelegramUser.github_summary != "",
-                    TelegramUser.job_posting != "",
-                    TelegramUser.analysis_summary != "",
-                )
-            )
-            .order_by(desc(TelegramUser.updated_at))
-        ).all()
-
-        return [
-            {
-                "chat_id": user.chat_id,
-                "profile": user.profile or "",
-                "resume": user.resume or "",
-                "github_url": user.github_url or "",
-                "github_summary": user.github_summary or "",
-                "job_posting": user.job_posting or "",
-                "analysis_summary": user.analysis_summary or "",
-            }
-            for user in users
-        ]
 
 
 def save_interview_turn(
@@ -441,44 +517,55 @@ def save_interview_questions(session_id: int, questions: list[dict[str, Any]]) -
         db.commit()
 
 
-def get_recent_sessions(chat_id: int, limit: int = 5) -> list[dict[str, Any]]:
+def get_recent_sessions(user_key: str, limit: int = 5) -> list[dict[str, Any]]:
     with SessionLocal() as db:
-        rows = db.execute(
-            select(
-                InterviewSession.id,
-                InterviewSession.status,
-                InterviewSession.summary,
-                InterviewSession.weakness_summary,
-                InterviewSession.created_at,
-                func.count(InterviewTurnRecord.id).label("turn_count"),
-            )
-            .join(TelegramUser, InterviewSession.user_id == TelegramUser.id)
-            .outerjoin(InterviewTurnRecord, InterviewTurnRecord.session_id == InterviewSession.id)
-            .where(TelegramUser.chat_id == chat_id)
-            .group_by(InterviewSession.id)
+        sessions = db.scalars(
+            select(InterviewSession)
+            .join(User, InterviewSession.user_id == User.id)
+            .where(User.user_key == user_key)
             .order_by(desc(InterviewSession.created_at))
             .limit(limit)
         ).all()
 
-    return [
-        {
-            "id": row.id,
-            "status": row.status,
-            "summary": row.summary or "",
-            "weakness_summary": row.weakness_summary or "",
-            "created_at": row.created_at,
-            "turn_count": row.turn_count,
-        }
-        for row in rows
-    ]
+        result: list[dict[str, Any]] = []
+        for session in sessions:
+            questions = db.scalars(
+                select(InterviewQuestionRecord)
+                .where(InterviewQuestionRecord.session_id == session.id)
+                .order_by(InterviewQuestionRecord.id)
+            ).all()
+            turns = db.scalars(
+                select(InterviewTurnRecord)
+                .where(InterviewTurnRecord.session_id == session.id)
+                .order_by(InterviewTurnRecord.id)
+            ).all()
+            regular_questions = [question for question in questions if not question.is_bonus]
+            result.append(
+                {
+                    "id": session.id,
+                    "status": session.status,
+                    "summary": session.summary or "",
+                    "weakness_summary": session.weakness_summary or "",
+                    "created_at": session.created_at,
+                    "turn_count": sum(1 for turn in turns if not turn.is_bonus),
+                    "question_count": len(regular_questions),
+                    "job_title": session.context_job_title or "",
+                    "job_summary": session.context_job_summary or "",
+                    "github_repositories": parse_json_list(session.context_github_repositories),
+                    "questions": [serialize_interview_question(question) for question in questions],
+                    "turns": [serialize_interview_turn(turn) for turn in turns],
+                }
+            )
+
+        return result
 
 
-def get_latest_weakness_summary(chat_id: int) -> str:
+def get_latest_weakness_summary(user_key: str) -> str:
     with SessionLocal() as db:
         row = db.execute(
             select(InterviewSession.weakness_summary)
-            .join(TelegramUser, InterviewSession.user_id == TelegramUser.id)
-            .where(TelegramUser.chat_id == chat_id)
+            .join(User, InterviewSession.user_id == User.id)
+            .where(User.user_key == user_key)
             .where(InterviewSession.weakness_summary != "")
             .order_by(desc(InterviewSession.created_at))
             .limit(1)
@@ -487,12 +574,12 @@ def get_latest_weakness_summary(chat_id: int) -> str:
     return row or ""
 
 
-def get_latest_feedback_summary(chat_id: int) -> str:
+def get_latest_feedback_summary(user_key: str) -> str:
     with SessionLocal() as db:
         row = db.execute(
             select(InterviewSession.summary)
-            .join(TelegramUser, InterviewSession.user_id == TelegramUser.id)
-            .where(TelegramUser.chat_id == chat_id)
+            .join(User, InterviewSession.user_id == User.id)
+            .where(User.user_key == user_key)
             .where(InterviewSession.status == "completed")
             .where(InterviewSession.summary != "")
             .order_by(desc(InterviewSession.created_at))
@@ -502,13 +589,13 @@ def get_latest_feedback_summary(chat_id: int) -> str:
     return row or ""
 
 
-def get_recent_turns(chat_id: int, limit: int = 20) -> list[InterviewTurn]:
+def get_recent_turns(user_key: str, limit: int = 20) -> list[InterviewTurn]:
     with SessionLocal() as db:
         rows = db.execute(
             select(InterviewTurnRecord)
             .join(InterviewSession, InterviewTurnRecord.session_id == InterviewSession.id)
-            .join(TelegramUser, InterviewSession.user_id == TelegramUser.id)
-            .where(TelegramUser.chat_id == chat_id)
+            .join(User, InterviewSession.user_id == User.id)
+            .where(User.user_key == user_key)
             .order_by(desc(InterviewTurnRecord.created_at))
             .limit(limit)
         ).scalars()

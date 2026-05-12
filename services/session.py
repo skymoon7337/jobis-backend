@@ -26,7 +26,6 @@ class UserSession:
     github_url: str = ""
     github_summary: str = ""
     job_posting: str = ""
-    analysis_summary: str = ""
     awaiting: str | None = None
     in_interview: bool = False
     active_interview_session_id: int | None = None
@@ -59,21 +58,10 @@ class UserSession:
             ("GitHub URL", self.github_url),
             ("GitHub 분석 자료", self.github_summary),
             ("관심 채용공고", self.job_posting),
-            ("통합 분석 결과", self.analysis_summary),
         ]
         return "\n\n".join(f"[{title}]\n{value}" for title, value in parts if value)
 
     def build_interview_context(self) -> str:
-        if self.analysis_summary:
-            parts = [
-                ("통합 분석 결과", self.analysis_summary),
-                ("사용자 프로필", self.profile),
-                ("자소서 원문", self.resume),
-                ("GitHub 분석 자료", self.github_summary),
-                ("관심 채용공고 원문", self.job_posting),
-            ]
-            return "\n\n".join(f"[{title}]\n{value}" for title, value in parts if value)
-
         return self.build_context()
 
     def build_history(self) -> str:

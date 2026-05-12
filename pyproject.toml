@@ -11,7 +11,6 @@ dependencies = [
     "httpx>=0.28.1",
     "openai>=2.11.0",
     "psycopg[binary]>=3.3.2",
-    "python-telegram-bot>=22.5",
     "python-dotenv>=1.2.2",
     "sqlalchemy>=2.0.45",
     "uvicorn>=0.46.0",

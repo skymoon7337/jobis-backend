@@ -1,6 +1,8 @@
 import os
 import asyncio
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 from google import genai
 from google.genai import types
@@ -8,6 +10,8 @@ from openai import AsyncOpenAI
 
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_LLM_RETRY_DELAYS = (2, 5, 10)
+T = TypeVar("T")
 
 
 class ModelProvider(ABC):
@@ -35,19 +39,82 @@ class GeminiProvider(ModelProvider):
     def __init__(self) -> None:
         self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         self.model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+        fallback_models = parse_csv_env("GEMINI_FALLBACK_MODELS")
+        self.models = [self.model, *[model for model in fallback_models if model != self.model]]
 
     async def ask(self, instructions: str, prompt: str, max_output_tokens: int = 900) -> str:
         config = types.GenerateContentConfig(
             system_instruction=instructions,
             max_output_tokens=max_output_tokens,
         )
-        response = await asyncio.to_thread(
-            self.client.models.generate_content,
-            model=self.model,
-            contents=prompt,
-            config=config,
-        )
-        return (response.text or "").strip()
+
+        last_error: Exception | None = None
+        for model in self.models:
+            try:
+                response = await asyncio.to_thread(
+                    self.client.models.generate_content,
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+                return (response.text or "").strip()
+            except Exception as exc:
+                last_error = exc
+                if not is_retryable_llm_error(exc):
+                    raise
+
+        if last_error:
+            raise last_error
+        return ""
+
+
+def parse_csv_env(name: str) -> list[str]:
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
+
+
+def retry_delays() -> tuple[int, ...]:
+    raw_delays = parse_csv_env("JOBIS_LLM_RETRY_DELAYS")
+    if not raw_delays:
+        return DEFAULT_LLM_RETRY_DELAYS
+
+    delays: list[int] = []
+    for raw_delay in raw_delays:
+        try:
+            delay = int(raw_delay)
+        except ValueError:
+            continue
+        if delay > 0:
+            delays.append(delay)
+    return tuple(delays) or DEFAULT_LLM_RETRY_DELAYS
+
+
+def is_retryable_llm_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    retryable_signals = (
+        "503",
+        "500",
+        "unavailable",
+        "overloaded",
+        "high demand",
+        "temporarily",
+        "timeout",
+        "timed out",
+        "rate limit",
+    )
+    return any(signal in message for signal in retryable_signals)
+
+
+async def run_with_retry(operation: Callable[[], Awaitable[T]]) -> T:
+    delays = retry_delays()
+    for attempt in range(len(delays) + 1):
+        try:
+            return await operation()
+        except Exception as exc:
+            if attempt >= len(delays) or not is_retryable_llm_error(exc):
+                raise
+            await asyncio.sleep(delays[attempt])
+
+    raise RuntimeError("LLM 재시도 처리 중 알 수 없는 오류가 발생했습니다.")
 
 
 def create_provider() -> ModelProvider:
@@ -65,7 +132,7 @@ class JobisLLM:
         self.provider = create_provider()
 
     async def _ask(self, instructions: str, prompt: str, max_output_tokens: int = 900) -> str:
-        return await self.provider.ask(instructions, prompt, max_output_tokens)
+        return await run_with_retry(lambda: self.provider.ask(instructions, prompt, max_output_tokens))
 
     def _question_type_rule(self, question_type: str | None) -> str:
         rules = {
@@ -124,7 +191,7 @@ class JobisLLM:
             "- 소재 1\n"
             "- 소재 2\n"
             "- 소재 3\n\n"
-            "다음 단계: /job 또는 /analyze\n\n"
+            "다음 단계: 공고 추가 후 면접 탭에서 질문 후보 만들기\n\n"
             "[DETAIL]\n"
             "반드시 다음 형식으로 작성해라.\n"
             "1. 프로젝트 한 줄 요약\n"
@@ -229,7 +296,7 @@ class JobisLLM:
             "- 포인트 1\n"
             "- 포인트 2\n"
             "- 포인트 3\n\n"
-            "다음 단계: /interview\n\n"
+            "다음 단계: 면접 탭에서 질문 후보 만들기\n\n"
             "[DETAIL]\n"
             "반드시 다음 형식으로 작성해줘.\n"
             "1. 지원 맥락: 직무/경력/학력/주요 기술 요약\n"
@@ -272,35 +339,40 @@ class JobisLLM:
         )
         return await self._ask(instructions, prompt, max_output_tokens=500)
 
-    async def generate_interview_questions(self, context: str) -> str:
+    async def generate_interview_questions(self, context: str, question_types: list[str] | None = None) -> str:
+        question_types = question_types or [
+            "CS 기본기",
+            "언어",
+            "기술스택",
+            "프로젝트/GitHub",
+            "프로젝트/자소서",
+        ]
+        question_order = "\n".join(
+            f"{index}. {question_type}" for index, question_type in enumerate(question_types, start=1)
+        )
+        output_format = "\n".join(
+            f"{index}. {question_type}: 질문" for index, question_type in enumerate(question_types, start=1)
+        )
+        type_rules = "\n".join(
+            f"- {question_type}: {self._question_type_rule(question_type)}"
+            for question_type in dict.fromkeys(question_types)
+        )
         instructions = (
-            "너는 jobis라는 개인 면접 코치다. 절약형 면접을 위해 시작 전에 질문 5개를 한 번에 설계한다. "
+            "너는 jobis라는 개인 면접 코치다. 절약형 면접을 위해 시작 전에 질문 후보를 한 번에 설계한다. "
             "질문 유형 순서를 반드시 지키고, 각 질문은 서로 다른 역량을 검증해야 한다. "
             "장황한 설명 없이 지정 형식만 출력한다."
         )
         prompt = (
-            "아래 컨텍스트를 바탕으로 면접 질문 5개를 한 번에 생성해줘.\n\n"
+            f"아래 컨텍스트를 바탕으로 면접 질문 {len(question_types)}개를 한 번에 생성해줘.\n\n"
             "질문 순서는 반드시 아래와 같아야 한다.\n"
-            "1. CS 기본기\n"
-            "2. 언어\n"
-            "3. 기술스택\n"
-            "4. 프로젝트/GitHub\n"
-            "5. 프로젝트/자소서\n\n"
+            f"{question_order}\n\n"
             "유형 규칙:\n"
-            f"- CS 기본기: {self._question_type_rule('CS 기본기')}\n"
-            f"- 언어: {self._question_type_rule('언어')}\n"
-            f"- 기술스택: {self._question_type_rule('기술스택')}\n"
-            f"- 프로젝트/GitHub: {self._question_type_rule('프로젝트/GitHub')}\n"
-            f"- 프로젝트/자소서: {self._question_type_rule('프로젝트/자소서')}\n\n"
-            "출력 형식은 반드시 아래 5줄만 사용해라. 다른 설명은 쓰지 마라.\n"
-            "1. CS 기본기: 질문\n"
-            "2. 언어: 질문\n"
-            "3. 기술스택: 질문\n"
-            "4. 프로젝트/GitHub: 질문\n"
-            "5. 프로젝트/자소서: 질문\n\n"
+            f"{type_rules}\n\n"
+            f"출력 형식은 반드시 아래 {len(question_types)}줄만 사용해라. 다른 설명은 쓰지 마라.\n"
+            f"{output_format}\n\n"
             f"{context}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=1000)
+        return await self._ask(instructions, prompt, max_output_tokens=1400)
 
     async def generate_bonus_question(
         self,
