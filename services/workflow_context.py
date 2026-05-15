@@ -1,4 +1,6 @@
-from db.repository import load_user_session, reset_user_context, update_user_fields
+from datetime import UTC, datetime
+
+from db.repository import load_context_data, load_user_session, reset_user_context, update_user_fields
 from services.formatting import build_progress_message
 from services.workflow_common import (
     WorkflowResult,
@@ -9,14 +11,7 @@ from services.workflow_common import (
 
 
 def context_payload(user_key: str) -> dict:
-    session = load_user_session(user_key)
-    return {
-        "profile": session.profile,
-        "resume": session.resume,
-        "github_url": session.github_url,
-        "github_summary": session.github_summary,
-        "job_posting": session.job_posting,
-    }
+    return load_context_data(user_key)
 
 
 def get_context(user_key: str | None = None) -> WorkflowResult:
@@ -63,7 +58,8 @@ def save_profile(profile: str, user_key: str | None = None) -> WorkflowResult:
         return blocked
 
     cleaned_profile = profile.strip()
-    update_user_fields(resolved_user_key, profile=cleaned_profile)
+    saved_at = datetime.now(UTC)
+    update_user_fields(resolved_user_key, profile=cleaned_profile, profile_updated_at=saved_at)
     session = load_user_session(resolved_user_key)
     message = (
         "프로필을 저장했습니다.\n\n"
@@ -73,7 +69,7 @@ def save_profile(profile: str, user_key: str | None = None) -> WorkflowResult:
     return WorkflowResult(
         messages=[message],
         status=session_status(session, user_key=resolved_user_key),
-        data={"profile": cleaned_profile},
+        data={"profile": cleaned_profile, "profile_updated_at": saved_at},
     )
 
 
@@ -84,7 +80,8 @@ def save_resume(resume: str, user_key: str | None = None) -> WorkflowResult:
         return blocked
 
     cleaned_resume = resume.strip()
-    update_user_fields(resolved_user_key, resume=cleaned_resume)
+    saved_at = datetime.now(UTC)
+    update_user_fields(resolved_user_key, resume=cleaned_resume, resume_updated_at=saved_at)
     session = load_user_session(resolved_user_key)
     message = (
         "자소서를 저장했습니다.\n\n"
@@ -94,5 +91,5 @@ def save_resume(resume: str, user_key: str | None = None) -> WorkflowResult:
     return WorkflowResult(
         messages=[message],
         status=session_status(session, user_key=resolved_user_key),
-        data={"resume": cleaned_resume},
+        data={"resume": cleaned_resume, "resume_updated_at": saved_at},
     )

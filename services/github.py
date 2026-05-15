@@ -1,3 +1,6 @@
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -7,6 +10,25 @@ MAX_FILE_CHARS = 6000
 MAX_TOTAL_FILE_CHARS = 50000
 MAX_SELECTED_FILES = 18
 MAX_TREE_PATHS = 250
+ProgressCallback = Callable[[str, str, int, int], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class GithubRepoMetadata:
+    owner: str
+    repo: str
+    repo_key: str
+    url: str
+    title: str
+    default_branch: str
+    commit_sha: str
+    commit_date: datetime | None
+
+
+@dataclass(frozen=True)
+class GithubRepoContext:
+    text: str
+    metadata: GithubRepoMetadata
 
 IGNORED_PATH_PARTS = {
     ".git",
@@ -106,6 +128,19 @@ def parse_github_repo_url(url: str) -> tuple[str, str]:
     return parts[0], parts[1].removesuffix(".git")
 
 
+def normalize_repo_url(owner: str, repo: str) -> str:
+    return f"https://github.com/{owner}/{repo}"
+
+
+def parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def truncate(text: str, max_chars: int, label: str) -> str:
     text = text.strip()
     if len(text) <= max_chars:
@@ -150,19 +185,46 @@ async def fetch_text(client: httpx.AsyncClient, url: str, *, accept: str | None 
     return response.text
 
 
-async def fetch_repo_context(url: str) -> str:
+async def report_progress(
+    progress: ProgressCallback | None,
+    stage: str,
+    message: str,
+    current: int,
+    total: int,
+) -> None:
+    if progress:
+        await progress(stage, message, current, total)
+
+
+async def fetch_repo_context(url: str, progress: ProgressCallback | None = None) -> GithubRepoContext:
     owner, repo = parse_github_repo_url(url)
 
     async with httpx.AsyncClient(timeout=10) as client:
+        await report_progress(progress, "fetching_repo", "저장소 정보를 확인하는 중입니다.", 1, 7)
         repo_response = await client.get(f"https://api.github.com/repos/{owner}/{repo}")
         repo_response.raise_for_status()
         repo_data = repo_response.json()
         default_branch = repo_data.get("default_branch", "main")
 
+        commit_sha = ""
+        commit_date = None
+        commit_response = await client.get(f"https://api.github.com/repos/{owner}/{repo}/commits/{default_branch}")
+        if commit_response.status_code == 200:
+            commit_data = commit_response.json()
+            commit_sha = commit_data.get("sha", "") or ""
+            commit_date = parse_datetime(
+                commit_data.get("commit", {}).get("committer", {}).get("date")
+                or commit_data.get("commit", {}).get("author", {}).get("date")
+            )
+        elif commit_response.status_code != 404:
+            commit_response.raise_for_status()
+
+        await report_progress(progress, "fetching_repo", "저장소 언어 정보를 확인하는 중입니다.", 1, 7)
         languages_response = await client.get(f"https://api.github.com/repos/{owner}/{repo}/languages")
         languages_response.raise_for_status()
         languages = languages_response.json()
 
+        await report_progress(progress, "reading_readme", "README와 프로젝트 설명을 읽는 중입니다.", 2, 7)
         readme = f"{owner}/{repo} 레포에서 README를 찾지 못했습니다."
         readme_response = await client.get(
             f"https://api.github.com/repos/{owner}/{repo}/readme",
@@ -173,6 +235,7 @@ async def fetch_repo_context(url: str) -> str:
         elif readme_response.status_code != 404:
             readme_response.raise_for_status()
 
+        await report_progress(progress, "reading_tree", "파일 구조를 살펴보는 중입니다.", 3, 7)
         tree_response = await client.get(
             f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1"
         )
@@ -183,16 +246,25 @@ async def fetch_repo_context(url: str) -> str:
             for item in tree_data.get("tree", [])
             if item.get("type") == "blob" and isinstance(item.get("path"), str)
         ]
+        total_file_count = len(file_paths)
 
         visible_paths = [path for path in file_paths if not should_ignore_path(path)]
         selected_files = select_interview_files(file_paths)
+        await report_progress(progress, "selecting_files", "면접에 사용할 주요 코드 파일을 고르는 중입니다.", 4, 7)
 
         file_blocks = []
         total_chars = 0
-        for path in selected_files:
+        for index, path in enumerate(selected_files, start=1):
             if total_chars >= MAX_TOTAL_FILE_CHARS:
                 break
 
+            await report_progress(
+                progress,
+                "reading_files",
+                f"전체 {total_file_count}개 파일 중 선별한 주요 코드 파일 {index}/{len(selected_files)}개를 읽는 중입니다.",
+                5,
+                7,
+            )
             raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{default_branch}/{path}"
             try:
                 content = await fetch_text(client, raw_url)
@@ -209,11 +281,13 @@ async def fetch_repo_context(url: str) -> str:
     tree_summary = "\n".join(f"- {path}" for path in visible_paths[:MAX_TREE_PATHS]) or "파일 트리를 읽지 못했습니다."
     file_context = "\n\n".join(file_blocks) or "읽은 주요 파일이 없습니다."
 
-    return (
+    text = (
         f"[레포 메타데이터]\n"
         f"이름: {owner}/{repo}\n"
         f"설명: {repo_data.get('description') or '없음'}\n"
         f"기본 브랜치: {default_branch}\n"
+        f"최신 커밋: {commit_sha or '확인 실패'}\n"
+        f"커밋 날짜: {commit_date.isoformat() if commit_date else '확인 실패'}\n"
         f"주 언어: {repo_data.get('language') or '없음'}\n"
         f"토픽: {topic_summary}\n"
         f"언어 비율 원본(bytes): {language_summary}\n\n"
@@ -222,7 +296,20 @@ async def fetch_repo_context(url: str) -> str:
         f"[파일 트리 요약]\n{tree_summary}\n\n"
         f"[주요 파일 내용]\n{file_context}"
     )
+    return GithubRepoContext(
+        text=text,
+        metadata=GithubRepoMetadata(
+            owner=owner,
+            repo=repo,
+            repo_key=f"{owner}/{repo}",
+            url=normalize_repo_url(owner, repo),
+            title=f"{owner}/{repo}",
+            default_branch=default_branch,
+            commit_sha=commit_sha,
+            commit_date=commit_date,
+        ),
+    )
 
 
 async def fetch_repo_readme(url: str) -> str:
-    return await fetch_repo_context(url)
+    return (await fetch_repo_context(url)).text

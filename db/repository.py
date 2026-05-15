@@ -1,10 +1,14 @@
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import desc, func, select
+from sqlalchemy.exc import IntegrityError
 
 from db.models import (
-    GithubRepositoryRecord,
+    AnalysisJobRecord,
+    GithubProjectRecord,
+    GithubSnapshotRecord,
     InterviewQuestionRecord,
     InterviewSession,
     InterviewTurnRecord,
@@ -23,7 +27,14 @@ def get_or_create_user(user_key: str) -> User:
 
         user = User(user_key=user_key)
         db.add(user)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            user = db.scalar(select(User).where(User.user_key == user_key))
+            if user:
+                return user
+            raise
         db.refresh(user)
         return user
 
@@ -37,6 +48,21 @@ def load_user_session(user_key: str) -> UserSession:
         github_summary=user.github_summary or "",
         job_posting=user.job_posting or "",
     )
+
+
+def load_context_data(user_key: str) -> dict[str, Any]:
+    user = get_or_create_user(user_key)
+    profile_updated_at = user.profile_updated_at or (user.updated_at if user.profile else None)
+    resume_updated_at = user.resume_updated_at or (user.updated_at if user.resume else None)
+    return {
+        "profile": user.profile or "",
+        "resume": user.resume or "",
+        "profile_updated_at": profile_updated_at,
+        "resume_updated_at": resume_updated_at,
+        "github_url": user.github_url or "",
+        "github_summary": user.github_summary or "",
+        "job_posting": user.job_posting or "",
+    }
 
 
 def update_user_fields(user_key: str, **fields: Any) -> None:
@@ -171,10 +197,13 @@ def delete_job_posting(user_key: str, list_index: int) -> tuple[dict[str, Any] |
 
 
 def serialize_job_posting(posting: JobPostingRecord, index: int | None = None) -> dict[str, Any]:
+    display_name = posting.alias or posting.title or f"공고 {posting.id}"
     return {
         "id": posting.id,
         "index": index,
         "title": posting.title or f"공고 {posting.id}",
+        "alias": posting.alias or "",
+        "display_name": display_name,
         "source_url": posting.source_url or "",
         "raw_text": posting.raw_text or "",
         "summary": posting.summary or "",
@@ -183,12 +212,86 @@ def serialize_job_posting(posting: JobPostingRecord, index: int | None = None) -
     }
 
 
-def create_github_repository(
+def update_job_posting_alias(user_key: str, list_index: int, alias: str) -> dict[str, Any] | None:
+    return update_job_posting_metadata(user_key, list_index, alias=alias)
+
+
+def update_job_posting_metadata(
+    user_key: str,
+    list_index: int,
+    *,
+    alias: str | None = None,
+    source_url: str | None = None,
+) -> dict[str, Any] | None:
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.user_key == user_key))
+        if not user:
+            return None
+
+        postings = db.scalars(
+            select(JobPostingRecord)
+            .where(JobPostingRecord.user_id == user.id)
+            .order_by(JobPostingRecord.id)
+        ).all()
+        if list_index < 1 or list_index > len(postings):
+            return None
+
+        posting = postings[list_index - 1]
+        if alias is not None:
+            posting.alias = alias.strip()[:200]
+        if source_url is not None:
+            posting.source_url = source_url.strip()[:500]
+        db.commit()
+        db.refresh(posting)
+        return serialize_job_posting(posting, index=list_index)
+
+
+def update_job_posting_content(
+    user_key: str,
+    list_index: int,
+    *,
+    title: str,
+    source_url: str,
+    raw_text: str,
+    summary: str,
+) -> dict[str, Any] | None:
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.user_key == user_key))
+        if not user:
+            return None
+
+        postings = db.scalars(
+            select(JobPostingRecord)
+            .where(JobPostingRecord.user_id == user.id)
+            .order_by(JobPostingRecord.id)
+        ).all()
+        if list_index < 1 or list_index > len(postings):
+            return None
+
+        posting = postings[list_index - 1]
+        posting.title = title
+        posting.source_url = source_url
+        posting.raw_text = raw_text
+        posting.summary = summary
+        if posting.is_selected:
+            user.job_posting = raw_text
+        db.commit()
+        db.refresh(posting)
+        return serialize_job_posting(posting, index=list_index)
+
+
+def upsert_github_repository_snapshot(
     user_key: str,
     *,
     url: str,
     title: str,
+    repo_key: str,
     summary: str,
+    change_summary: str = "",
+    default_branch: str = "",
+    commit_sha: str = "",
+    commit_date: datetime | None = None,
+    alias: str = "",
 ) -> dict[str, Any]:
     with SessionLocal() as db:
         user = db.scalar(select(User).where(User.user_key == user_key))
@@ -197,24 +300,62 @@ def create_github_repository(
             db.add(user)
             db.flush()
 
-        repository = GithubRepositoryRecord(
-            user_id=user.id,
-            url=url,
-            title=title,
+        project = db.scalar(
+            select(GithubProjectRecord)
+            .where(GithubProjectRecord.user_id == user.id)
+            .where(GithubProjectRecord.repo_key == repo_key)
+        )
+        if not project:
+            project = GithubProjectRecord(
+                user_id=user.id,
+                repo_key=repo_key,
+                url=url,
+                alias=alias,
+                title=title,
+            )
+            db.add(project)
+            db.flush()
+        else:
+            project.url = url
+            project.title = title or project.title
+            if alias:
+                project.alias = alias
+
+        latest_snapshot = db.scalar(
+            select(GithubSnapshotRecord)
+            .where(GithubSnapshotRecord.project_id == project.id)
+            .where(GithubSnapshotRecord.is_latest.is_(True))
+            .order_by(desc(GithubSnapshotRecord.version))
+            .limit(1)
+        )
+        next_version = (latest_snapshot.version if latest_snapshot else 0) + 1
+        if latest_snapshot:
+            latest_snapshot.is_latest = False
+
+        snapshot = GithubSnapshotRecord(
+            project_id=project.id,
+            version=next_version,
             summary=summary,
+            change_summary=change_summary,
+            default_branch=default_branch,
+            commit_sha=commit_sha,
+            commit_date=commit_date,
+            analyzed_at=datetime.now(UTC),
+            is_latest=True,
         )
         user.github_url = url
         user.github_summary = summary
-        db.add(repository)
+        db.add(snapshot)
         db.commit()
-        db.refresh(repository)
-        repositories = db.scalars(
-            select(GithubRepositoryRecord)
-            .where(GithubRepositoryRecord.user_id == user.id)
-            .order_by(GithubRepositoryRecord.id)
+        db.refresh(project)
+        db.refresh(snapshot)
+        projects = db.scalars(
+            select(GithubProjectRecord)
+            .where(GithubProjectRecord.user_id == user.id)
+            .order_by(GithubProjectRecord.id)
         ).all()
-        index = next((position for position, item in enumerate(repositories, start=1) if item.id == repository.id), None)
-        return serialize_github_repository(repository, index=index)
+        index = next((position for position, item in enumerate(projects, start=1) if item.id == project.id), None)
+        return serialize_github_project(project, snapshot=snapshot, index=index)
 
 
 def get_github_repositories(user_key: str) -> list[dict[str, Any]]:
@@ -223,24 +364,38 @@ def get_github_repositories(user_key: str) -> list[dict[str, Any]]:
         if not user:
             return []
 
-        repositories = db.scalars(
-            select(GithubRepositoryRecord)
-            .where(GithubRepositoryRecord.user_id == user.id)
-            .order_by(GithubRepositoryRecord.id)
+        projects = db.scalars(
+            select(GithubProjectRecord)
+            .where(GithubProjectRecord.user_id == user.id)
+            .order_by(GithubProjectRecord.id)
         ).all()
-
-        if not repositories and user.github_summary:
-            repository = GithubRepositoryRecord(
+        if not projects and user.github_summary:
+            title = github_repository_title(user.github_url or "")
+            project = GithubProjectRecord(
                 user_id=user.id,
+                repo_key=title,
                 url=user.github_url or "",
-                title=github_repository_title(user.github_url or ""),
-                summary=user.github_summary or "",
+                title=title,
             )
-            db.add(repository)
+            db.add(project)
+            db.flush()
+            db.add(
+                GithubSnapshotRecord(
+                    project_id=project.id,
+                    version=1,
+                    summary=user.github_summary or "",
+                    change_summary="기존 GitHub 분석을 스냅샷으로 복구했습니다.",
+                    analyzed_at=datetime.now(UTC),
+                    is_latest=True,
+                )
+            )
             db.commit()
-            repositories = [repository]
+            projects = [project]
 
-        return [serialize_github_repository(repository, index=index) for index, repository in enumerate(repositories, start=1)]
+        return [
+            serialize_github_project(project, snapshot=get_latest_github_snapshot(db, project.id), index=index)
+            for index, project in enumerate(projects, start=1)
+        ]
 
 
 def get_github_repositories_by_indices(user_key: str, list_indices: list[int]) -> list[dict[str, Any]]:
@@ -253,40 +408,258 @@ def get_github_repositories_by_indices(user_key: str, list_indices: list[int]) -
     return selected
 
 
+def get_github_repository_by_repo_key(user_key: str, repo_key: str) -> dict[str, Any] | None:
+    with SessionLocal() as db:
+        project = db.scalar(
+            select(GithubProjectRecord)
+            .join(User, GithubProjectRecord.user_id == User.id)
+            .where(User.user_key == user_key)
+            .where(GithubProjectRecord.repo_key == repo_key)
+        )
+        if not project:
+            return None
+
+        projects = db.scalars(
+            select(GithubProjectRecord)
+            .where(GithubProjectRecord.user_id == project.user_id)
+            .order_by(GithubProjectRecord.id)
+        ).all()
+        index = next((position for position, item in enumerate(projects, start=1) if item.id == project.id), None)
+        return serialize_github_project(project, snapshot=get_latest_github_snapshot(db, project.id), index=index)
+
+
+def update_github_repository_alias(user_key: str, list_index: int, alias: str) -> dict[str, Any] | None:
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.user_key == user_key))
+        if not user:
+            return None
+
+        projects = db.scalars(
+            select(GithubProjectRecord)
+            .where(GithubProjectRecord.user_id == user.id)
+            .order_by(GithubProjectRecord.id)
+        ).all()
+        if list_index < 1 or list_index > len(projects):
+            return None
+
+        project = projects[list_index - 1]
+        project.alias = alias.strip()[:200]
+        db.commit()
+        db.refresh(project)
+        return serialize_github_project(project, snapshot=get_latest_github_snapshot(db, project.id), index=list_index)
+
+
 def delete_github_repository(user_key: str, list_index: int) -> dict[str, Any] | None:
     with SessionLocal() as db:
         user = db.scalar(select(User).where(User.user_key == user_key))
         if not user:
             return None
 
-        repositories = db.scalars(
-            select(GithubRepositoryRecord)
-            .where(GithubRepositoryRecord.user_id == user.id)
-            .order_by(GithubRepositoryRecord.id)
+        projects = db.scalars(
+            select(GithubProjectRecord)
+            .where(GithubProjectRecord.user_id == user.id)
+            .order_by(GithubProjectRecord.id)
         ).all()
-        if list_index < 1 or list_index > len(repositories):
+        if list_index < 1 or list_index > len(projects):
             return None
 
-        repository = repositories[list_index - 1]
-        deleted = serialize_github_repository(repository, index=list_index)
-        db.delete(repository)
-        remaining = [item for item in repositories if item.id != repository.id]
-        if user.github_url == repository.url and user.github_summary == repository.summary:
-            latest = remaining[-1] if remaining else None
-            user.github_url = latest.url if latest else ""
+        project = projects[list_index - 1]
+        latest_snapshot = get_latest_github_snapshot(db, project.id)
+        deleted = serialize_github_project(project, snapshot=latest_snapshot, index=list_index)
+        db.delete(project)
+        remaining = [item for item in projects if item.id != project.id]
+        if user.github_url == project.url:
+            latest_project = remaining[-1] if remaining else None
+            latest = get_latest_github_snapshot(db, latest_project.id) if latest_project else None
+            user.github_url = latest_project.url if latest_project else ""
             user.github_summary = latest.summary if latest else ""
         db.commit()
         return deleted
 
 
-def serialize_github_repository(repository: GithubRepositoryRecord, index: int | None = None) -> dict[str, Any]:
+ACTIVE_JOB_STATUSES = {"queued", "running"}
+
+
+def create_analysis_job(
+    user_key: str,
+    *,
+    kind: str,
+    input_data: dict[str, Any],
+    stage: str,
+    message: str,
+    progress_current: int,
+    progress_total: int,
+) -> dict[str, Any]:
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.user_key == user_key))
+        if not user:
+            user = User(user_key=user_key)
+            db.add(user)
+            db.flush()
+
+        job = AnalysisJobRecord(
+            user_id=user.id,
+            kind=kind,
+            status="queued",
+            stage=stage,
+            message=message,
+            progress_current=progress_current,
+            progress_total=progress_total,
+            input_json=json.dumps(input_data, ensure_ascii=False, default=str),
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return serialize_analysis_job(job)
+
+
+def get_analysis_job(user_key: str, job_id: int) -> dict[str, Any] | None:
+    with SessionLocal() as db:
+        job = db.scalar(
+            select(AnalysisJobRecord)
+            .join(User, AnalysisJobRecord.user_id == User.id)
+            .where(User.user_key == user_key)
+            .where(AnalysisJobRecord.id == job_id)
+        )
+        return serialize_analysis_job(job) if job else None
+
+
+def get_active_analysis_job(user_key: str, kind: str) -> dict[str, Any] | None:
+    with SessionLocal() as db:
+        job = db.scalar(
+            select(AnalysisJobRecord)
+            .join(User, AnalysisJobRecord.user_id == User.id)
+            .where(User.user_key == user_key)
+            .where(AnalysisJobRecord.kind == kind)
+            .where(AnalysisJobRecord.status.in_(ACTIVE_JOB_STATUSES))
+            .order_by(desc(AnalysisJobRecord.created_at))
+            .limit(1)
+        )
+        return serialize_analysis_job(job) if job else None
+
+
+def get_active_analysis_jobs(user_key: str) -> dict[str, dict[str, Any]]:
+    with SessionLocal() as db:
+        jobs = db.scalars(
+            select(AnalysisJobRecord)
+            .join(User, AnalysisJobRecord.user_id == User.id)
+            .where(User.user_key == user_key)
+            .where(AnalysisJobRecord.status.in_(ACTIVE_JOB_STATUSES))
+            .order_by(desc(AnalysisJobRecord.created_at))
+        ).all()
+
+        latest_by_kind: dict[str, dict[str, Any]] = {}
+        for job in jobs:
+            if job.kind not in latest_by_kind:
+                latest_by_kind[job.kind] = serialize_analysis_job(job)
+        return latest_by_kind
+
+
+def update_analysis_job(
+    job_id: int,
+    *,
+    status: str | None = None,
+    stage: str | None = None,
+    message: str | None = None,
+    progress_current: int | None = None,
+    progress_total: int | None = None,
+    result_data: dict[str, Any] | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    finished: bool = False,
+) -> dict[str, Any] | None:
+    with SessionLocal() as db:
+        job = db.get(AnalysisJobRecord, job_id)
+        if not job:
+            return None
+
+        if status is not None:
+            job.status = status
+        if stage is not None:
+            job.stage = stage
+        if message is not None:
+            job.message = message
+        if progress_current is not None:
+            job.progress_current = progress_current
+        if progress_total is not None:
+            job.progress_total = progress_total
+        if result_data is not None:
+            job.result_json = json.dumps(result_data, ensure_ascii=False, default=str)
+        if error_type is not None:
+            job.error_type = error_type
+        if error_message is not None:
+            job.error_message = error_message
+        if finished:
+            job.finished_at = datetime.now(UTC)
+
+        db.commit()
+        db.refresh(job)
+        return serialize_analysis_job(job)
+
+
+def serialize_analysis_job(job: AnalysisJobRecord) -> dict[str, Any]:
     return {
-        "id": repository.id,
+        "id": job.id,
+        "kind": job.kind or "",
+        "status": job.status or "",
+        "stage": job.stage or "",
+        "message": job.message or "",
+        "progress_current": job.progress_current or 0,
+        "progress_total": job.progress_total or 0,
+        "input": parse_json_object(job.input_json),
+        "result": parse_json_object(job.result_json),
+        "error_type": job.error_type or "",
+        "error_message": job.error_message or "",
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "finished_at": job.finished_at,
+    }
+
+
+def parse_json_object(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def get_latest_github_snapshot(db, project_id: int) -> GithubSnapshotRecord | None:
+    return db.scalar(
+        select(GithubSnapshotRecord)
+        .where(GithubSnapshotRecord.project_id == project_id)
+        .where(GithubSnapshotRecord.is_latest.is_(True))
+        .order_by(desc(GithubSnapshotRecord.version))
+        .limit(1)
+    )
+
+
+def serialize_github_project(
+    project: GithubProjectRecord,
+    *,
+    snapshot: GithubSnapshotRecord | None,
+    index: int | None = None,
+) -> dict[str, Any]:
+    display_name = project.alias or project.title or project.repo_key or f"GitHub 저장소 {project.id}"
+    return {
+        "id": project.id,
         "index": index,
-        "url": repository.url or "",
-        "title": repository.title or f"GitHub 저장소 {repository.id}",
-        "summary": repository.summary or "",
-        "created_at": repository.created_at,
+        "project_id": project.id,
+        "snapshot_id": snapshot.id if snapshot else None,
+        "url": project.url or "",
+        "repo_key": project.repo_key or "",
+        "title": project.title or project.repo_key or f"GitHub 저장소 {project.id}",
+        "alias": project.alias or "",
+        "display_name": display_name,
+        "summary": snapshot.summary if snapshot else "",
+        "change_summary": snapshot.change_summary if snapshot else "",
+        "version": snapshot.version if snapshot else 0,
+        "default_branch": snapshot.default_branch if snapshot else "",
+        "commit_sha": snapshot.commit_sha if snapshot else "",
+        "commit_date": snapshot.commit_date if snapshot else None,
+        "analyzed_at": snapshot.analyzed_at if snapshot else None,
+        "is_latest": bool(snapshot.is_latest) if snapshot else False,
+        "created_at": project.created_at,
     }
 
 
@@ -306,6 +679,8 @@ def reset_user_context(user_key: str) -> None:
 
         user.profile = ""
         user.resume = ""
+        user.profile_updated_at = None
+        user.resume_updated_at = None
         user.github_url = ""
         user.github_summary = ""
         user.job_posting = ""
@@ -314,9 +689,9 @@ def reset_user_context(user_key: str) -> None:
         for posting in postings:
             db.delete(posting)
 
-        repositories = db.scalars(select(GithubRepositoryRecord).where(GithubRepositoryRecord.user_id == user.id)).all()
-        for repository in repositories:
-            db.delete(repository)
+        projects = db.scalars(select(GithubProjectRecord).where(GithubProjectRecord.user_id == user.id)).all()
+        for project in projects:
+            db.delete(project)
 
         db.commit()
 
@@ -350,6 +725,7 @@ def create_interview_session(user_key: str, context_snapshot: dict[str, Any] | N
             context_github_repositories=json.dumps(
                 snapshot.get("github_repositories", []),
                 ensure_ascii=False,
+                default=str,
             ),
         )
         db.add(interview_session)

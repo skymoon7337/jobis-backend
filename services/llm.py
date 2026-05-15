@@ -224,6 +224,27 @@ class JobisLLM:
         )
         return await self._ask(instructions, prompt, max_output_tokens=2200)
 
+    async def summarize_github_changes(self, previous_summary: str, current_summary: str) -> str:
+        instructions = (
+            "너는 GitHub 레포 분석 스냅샷의 변경점을 짧게 비교하는 분석가다. "
+            "이전 분석과 새 분석의 차이를 사용자에게 보여줄 수 있게 요약한다. "
+            "과장하지 말고, 확인 가능한 변화와 새로 눈에 띄는 면접 소재만 쓴다. "
+            "마크다운 제목, 굵게 표시, 코드블록을 쓰지 않는다."
+        )
+        prompt = (
+            "이전 GitHub 분석과 새 GitHub 분석을 비교해서 변경 요약을 작성해줘.\n\n"
+            "형식:\n"
+            "- 새로 눈에 띄는 점 1\n"
+            "- 바뀌었거나 더 명확해진 점 1\n"
+            "- 면접 준비에 추가로 반영할 점 1\n\n"
+            "큰 변화가 없으면 '큰 변화는 없고, 최신 분석 기준으로 저장했습니다.'라고 짧게 말해줘.\n\n"
+            "[이전 분석]\n"
+            f"{previous_summary[:6000]}\n\n"
+            "[새 분석]\n"
+            f"{current_summary[:6000]}"
+        )
+        return await self._ask(instructions, prompt, max_output_tokens=500)
+
     async def summarize_for_user(self, title: str, detail: str) -> str:
         instructions = (
             "너는 텔레그램 봇의 사용자 안내 문구를 작성한다. "
@@ -254,7 +275,7 @@ class JobisLLM:
             "마크다운 제목, 굵게 표시, 코드블록은 쓰지 않는다."
         )
         prompt = (
-            "다음 채용공고를 텔레그램에서 보기 좋게 요약해줘.\n\n"
+            "다음 채용공고를 면접 준비 화면에서 보기 좋게 요약해줘.\n\n"
             "반드시 아래 형식을 지켜라.\n\n"
             "[TITLE]\n"
             "회사명 - 직무명\n\n"

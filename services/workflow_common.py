@@ -1,5 +1,6 @@
 import os
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime
 from typing import Any
 
 from db.repository import get_active_interview_snapshot, load_user_session
@@ -21,7 +22,19 @@ class WorkflowResult:
     ok: bool = True
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return json_safe(asdict(self))
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe(item) for item in value]
+    return value
 
 
 def default_user_key() -> str:

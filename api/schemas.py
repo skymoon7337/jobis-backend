@@ -37,6 +37,18 @@ class JobRequest(BaseModel):
         return cleaned
 
 
+class JobMetaRequest(BaseModel):
+    alias: str | None = Field(default=None, max_length=200)
+    source_url: str | None = Field(default=None, max_length=500)
+
+    @field_validator("alias", "source_url")
+    @classmethod
+    def text_fields_must_be_clean(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip()
+
+
 class GithubAnalyzeRequest(BaseModel):
     url: str = Field(min_length=1)
 
@@ -47,6 +59,15 @@ class GithubAnalyzeRequest(BaseModel):
         if not cleaned:
             raise ValueError("url must not be blank")
         return cleaned
+
+
+class GithubAliasRequest(BaseModel):
+    alias: str = Field(default="", max_length=200)
+
+    @field_validator("alias")
+    @classmethod
+    def alias_must_be_clean(cls, value: str) -> str:
+        return value.strip()
 
 
 class InterviewAnswerRequest(BaseModel):
@@ -68,9 +89,16 @@ class InterviewStartRequest(BaseModel):
 
 
 class InterviewQuestionPlanRequest(BaseModel):
-    job_index: int | None = Field(default=None, ge=1)
-    github_indices: list[int] = Field(default_factory=list)
-    question_counts: dict[str, int] = Field(default_factory=dict)
+    job_index: int = Field(ge=1)
+    github_indices: list[int] = Field(min_length=1)
+    question_counts: dict[str, int] = Field(min_length=1)
+
+    @field_validator("github_indices")
+    @classmethod
+    def github_indices_must_be_positive(cls, value: list[int]) -> list[int]:
+        if any(index < 1 for index in value):
+            raise ValueError("github index must be positive")
+        return value
 
     @field_validator("question_counts")
     @classmethod
