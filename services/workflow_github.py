@@ -4,7 +4,9 @@ from db.repository import (
     get_active_analysis_job,
     get_github_repository_by_repo_key,
     get_github_repositories,
+    get_latest_completed_analysis_job_by_input,
     load_user_session,
+    save_agent_chat_message,
     update_github_repository_alias,
     update_analysis_job,
     upsert_github_repository_snapshot,
@@ -55,7 +57,7 @@ def list_github_repositories(user_key: str | None = None) -> WorkflowResult:
     )
 
 
-def create_github_analysis_job(url: str, user_key: str | None = None) -> tuple[WorkflowResult, bool]:
+def create_github_analysis_job(url: str, user_key: str | None = None, force: bool = False) -> tuple[WorkflowResult, bool]:
     resolved_user_key = user_key or default_user_key()
     blocked = ensure_context_mutable(resolved_user_key)
     if blocked:
@@ -77,6 +79,24 @@ def create_github_analysis_job(url: str, user_key: str | None = None) -> tuple[W
             False,
         )
 
+    input_data = {"url": github_url}
+    if not force:
+        cached_job = get_latest_completed_analysis_job_by_input(
+            resolved_user_key,
+            GITHUB_ANALYSIS_JOB_KIND,
+            input_data,
+        )
+        if cached_job:
+            session = load_user_session(resolved_user_key)
+            return (
+                WorkflowResult(
+                    messages=["같은 GitHub URL로 만든 기존 분석 결과를 불러왔습니다."],
+                    status=session_status(session, user_key=resolved_user_key),
+                    data={"job": cached_job, "cached": True},
+                ),
+                False,
+            )
+
     active_job = get_active_analysis_job(resolved_user_key, GITHUB_ANALYSIS_JOB_KIND)
     if active_job:
         session = load_user_session(resolved_user_key)
@@ -92,7 +112,7 @@ def create_github_analysis_job(url: str, user_key: str | None = None) -> tuple[W
     job = create_analysis_job(
         resolved_user_key,
         kind=GITHUB_ANALYSIS_JOB_KIND,
-        input_data={"url": github_url},
+        input_data=input_data,
         stage="queued",
         message="GitHub 분석을 준비하고 있습니다.",
         progress_current=0,
@@ -187,10 +207,37 @@ async def run_github_analysis_job(job_id: int, user_key: str, url: str) -> None:
             result_data=github_payload(user_key),
             finished=True,
         )
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content="GitHub 분석이 완료됐어.",
+            action="github_analysis_completed",
+        )
+        from services.agent import run_pending_agent_commands_for_job
+
+        await run_pending_agent_commands_for_job(user_key, job_id)
     except ValueError as exc:
         fail_github_analysis_job(job_id, "validation_error", str(exc))
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"GitHub 분석에 실패했어.\n\n{str(exc)[:500]}",
+            action="github_analysis_failed",
+        )
+        from services.agent import fail_pending_agent_commands_for_job
+
+        fail_pending_agent_commands_for_job(user_key, job_id, str(exc))
     except Exception as exc:
         fail_github_analysis_job(job_id, classify_github_analysis_error(exc), str(exc))
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"GitHub 분석에 실패했어.\n\n{str(exc)[:500]}",
+            action="github_analysis_failed",
+        )
+        from services.agent import fail_pending_agent_commands_for_job
+
+        fail_pending_agent_commands_for_job(user_key, job_id, str(exc))
 
 
 def fail_github_analysis_job(job_id: int, error_type: str, error_message: str) -> None:

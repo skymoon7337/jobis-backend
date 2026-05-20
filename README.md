@@ -1,250 +1,177 @@
-## jobis backend
+# jobis backend
 
-로컬 웹에서 사용하는 개인 맞춤 면접 에이전트 MVP입니다.
+로컬 개인용 취업/면접 에이전트 백엔드입니다. FastAPI로 실행되며, 프론트엔드는 `jobis-frontend`의 Next.js 앱을 사용합니다.
 
-사용자의 프로필, 자소서, GitHub 레포, 채용공고를 바탕으로 면접 질문 후보를 만들고, 선택한 질문으로 면접을 진행한 뒤 세션 리뷰와 약점 요약을 제공합니다. 기본 실행은 로컬 FastAPI + 웹 프론트엔드입니다.
+## 현재 구현
 
-## 현재 구현된 것
+- 채팅 명령 처리: `/api/agent`
+- 프로필/자소서 저장
+- 공고 저장, 목록, 선택, 삭제
+- GitHub 레포 분석, 목록, 삭제
+- 공고 + GitHub 기반 질문 후보 생성
+- 질문 후보 기반 면접 시작
+- 면접 답변 제출, 다음 질문, 꼬리질문, 추가질문
+- 최종 리뷰 생성, 최근 리뷰 조회
+- 진행 중 면접 이어하기
+- background job과 pending command
+- 같은 입력의 분석 job 캐시 재사용
+- 약점 학습: 최종 리뷰에서 `weakness_items` 누적
+- 면접 기억: 질문/답변/리뷰를 `memory_items`로 저장
+- keyword 기반 기억 검색
+- 이전 면접 기록 검색
+  - 자연어로 과거 면접 질문/답변/피드백/최종 리뷰 검색
+  - 결과 없음 시 최근 리뷰로 임의 이동하지 않음
+  - 같은 세션의 같은 문항은 질문/답변/최종 리뷰를 통합 결과로 병합
+  - 대표 4개 결과와 다음 4개 결과(`next_matches`)를 분리해 반환
+  - `최근 N주/개월`, `답변/피드백 있는 것만` 필터 지원
+  - 회사명/GitHub 프로젝트명은 검색 색인으로 쓰되 표시 excerpt에는 섞지 않음
+  - 세부검색 추천 prompt(`refine_suggestions`) 반환
+- 테스트 user key 분리와 민감 로그 마스킹
 
-### 입력 관리
+## 아직 안 한 것
 
-- 프로필 저장
-- 자소서 저장
-- GitHub 레포 URL 입력 후 README, 파일 구조, 주요 코드 기반 분석
-- 채용공고 추가, 목록 확인, 선택/삭제
+- 이전 면접 검색 품질 고도화
+  - 동의어/가중치: `메모리 한계`, `OOM`, `JVM 메모리 초과` 같은 표현 묶기
+  - embedding 기반 의미 검색
+- 검색 필터 UI와 맞물리는 서버 필터 확장
+  - 회사, GitHub, 질문 타입, 기간, 답변 있음 여부를 구조화된 파라미터로 받을 수 있게 확장
+- LLM JSON 기반 약점 추출 고도화
+- 학습 데이터 중복/노이즈 튜닝
+- 배포/로그인
 
-### 면접
+위 항목은 실제 사용 데이터가 어느 정도 쌓인 뒤 붙이는 쪽이 좋습니다.
 
-- 공고와 GitHub 프로젝트를 선택한 뒤 질문 후보 생성
-- 질문 유형별 개수 조절:
-  - CS 기본기
-  - 언어
-  - 기술스택
-  - 프로젝트/GitHub
-  - 프로젝트/자소서
-- 질문 후보 중 사용할 질문을 선택해 면접 시작
-- 방금 답변에 대한 꼬리질문 생성
-- 같은 분야의 추가질문 생성
-- 다음 기본 질문 또는 전체 평가로 이동
-- 질문 번호:
-  - `1-1` 기본 질문
-  - `1-2` 같은 섹션 추가질문
-  - `1-2-f1` 특정 답변의 꼬리질문
+## 환경 변수
 
-### 저장/복구
-
-- Postgres에 사용자 입력, GitHub 분석 결과, 공고, 면접 세션, 생성 질문, 답변 기록 저장
-- 서버가 꺼졌다 켜져도 진행 중 면접 복원
-- 면접 세션 시작 시 선택한 공고와 GitHub 프로젝트 스냅샷 저장
-
-### 보기/복기
-
-- 로컬 웹에서 현재 입력 상태, GitHub 분석, 면접 진행, 세션 리뷰 조회
-- 리뷰 탭에서 세션별 공고/GitHub 스냅샷, 질문/답변 기록, 종합 리뷰 확인
-- 약점 분석 탭은 누적 개인화 대시보드로 개편 예정
-
-## 실행 준비
-
-`.env.example`을 참고해서 `.env`를 만듭니다.
+`.env.example`을 참고해 `.env`를 만듭니다.
 
 ```bash
 JOBIS_MODE=local
 JOBIS_DEFAULT_USER_KEY=local
 JOBIS_PROVIDER=gemini
-GEMINI_API_KEY=Google_AI_Studio에서_받은_키
-GEMINI_MODEL=gemini-3.1-flash-lite-preview
+
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-2.5-flash-lite
+JOBIS_MAIN_CHAT_MODEL=gemini-2.5-flash-lite
+JOBIS_ANALYSIS_MODEL=gemini-2.5-flash
+JOBIS_EMBEDDING_MODEL=gemini-embedding-2
 GEMINI_FALLBACK_MODELS=gemini-2.5-flash-lite
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-5.2
-JOBIS_LLM_RETRY_DELAYS=5,10,20
 
 DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=jobis
-DB_USERNAME=로컬_DB_사용자명
-DB_PASSWORD=로컬_DB_비밀번호
+DB_USERNAME=...
+DB_PASSWORD=...
 ```
 
-Gemini가 `503 UNAVAILABLE` 또는 high demand를 반환하면 `JOBIS_LLM_RETRY_DELAYS` 간격으로 재시도합니다. `GEMINI_FALLBACK_MODELS`에 쉼표로 대체 모델을 넣으면 기본 모델이 일시 과부하일 때 같은 요청을 대체 모델에도 시도합니다.
+`JOBIS_EMBEDDING_MODEL`은 지금은 후보값만 유지합니다. 실제 vector 검색은 아직 구현하지 않았습니다.
 
-의존성을 설치합니다.
+## 실행
+
+의존성 설치:
 
 ```bash
 uv sync
 ```
 
-## Postgres 실행
+DB 준비:
 
-이미 `localhost:5432`에 Postgres가 떠 있다면 새 컨테이너를 만들 필요는 없습니다. 기존 컨테이너를 쓰는 경우 `jobis` DB만 만들어주면 됩니다.
+```bash
+docker compose up -d
+uv run python -m db.init_db
+```
+
+기존 Postgres를 쓰는 경우에는 `jobis` DB만 만들어두면 됩니다.
 
 ```bash
 docker exec -it postgres18 psql -U postgres -c "CREATE DATABASE jobis;"
 ```
 
-새 컨테이너가 필요할 때만 Docker Compose로 로컬 Postgres를 실행합니다.
-
-```bash
-docker compose up -d
-```
-
-DB 테이블과 개발용 컬럼 마이그레이션을 적용합니다.
-
-```bash
-uv run python -m db.init_db
-```
-
-## 로컬 API 실행
+백엔드 실행:
 
 ```bash
 uv run uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-프론트엔드는 `jobis-frontend`에서 실행합니다.
+프론트 실행:
 
 ```bash
+cd ../jobis-frontend
 npm run dev
 ```
 
-브라우저에서 `http://localhost:3000`을 엽니다.
+접속:
 
-## 권장 사용 순서
+```text
+http://localhost:3000
+```
 
-1. 입력 관리에서 프로필과 자소서를 저장합니다.
-2. GitHub 저장소를 분석해 보관합니다.
-3. 공고를 저장합니다.
-4. 면접 탭에서 공고와 GitHub 프로젝트를 선택합니다.
-5. 질문 구성을 정하고 질문 후보를 만듭니다.
-6. 사용할 질문을 선택해 면접을 시작합니다.
+## 주요 채팅 명령
 
-면접 중에는 답변을 보낸 뒤 아래 중 하나를 선택합니다.
+```text
+공고 목록 보여줘
+공고 저장해줘 https://example.com/job
+GitHub 분석해줘 https://github.com/user/repo
 
-다음 질문, 꼬리질문, 추가질문 중 하나를 웹 화면에서 선택할 수 있습니다.
+1번 공고랑 1번 GitHub로 질문 5개 만들어줘
+방금 만든 질문 후보로 면접 시작해줘
+현재 질문 보여줘
+내 답변은 ...
+다음 질문
+꼬리질문 해줘
+최종 리뷰 만들어줘
+최근 리뷰 불러줘
+내가 했던 면접중에 웹소켓 관련 질문이 있었나?
+메모리 관련 질문 답변 있었나?
+메모리 답변 피드백 있는 최근 2주 면접 기록 찾아줘
 
-서버를 껐다 켠 뒤 다시 접속하면 진행 중인 면접 세션을 조회해 이어갈 수 있습니다.
+내 약점 보여줘
+이번에 뭐 연습하면 돼?
+트랜잭션 피드백 찾아줘
+약점 학습 초기화 확인
+```
 
-## 주요 기능
+## 동작 메모
 
-### 시작/입력
+- `새로`, `다시`, `재분석`, `재생성`, `갱신`, `업데이트`가 들어간 명령은 기존 캐시를 건너뛰고 새 job을 만듭니다.
+- 진행 중 면접에서 `면접 시작해줘`를 다시 보내면 새 면접을 만들지 않고 현재 면접을 보여줍니다.
+- `delete_user_data()`는 기본적으로 `test-agent-*` 사용자만 삭제합니다.
+- action/pending 공개 payload는 API key, token, password류를 마스킹합니다.
+- 공고 원문과 GitHub 분석 전체는 장기기억 본문으로 복제하지 않고, 면접 세션의 source metadata로 연결합니다.
+- 기억 검색은 현재 keyword 기반입니다.
+- 이전 면접 기록 검색도 현재 keyword 기반입니다. 결과 수가 많아질 때는 전체를 반환하지 않고 대표 결과와 다음 묶음만 반환합니다.
+- 세부검색 추천은 자동 실행용이 아니라 프론트 입력창에 채우는 prompt입니다.
 
-- 프로필 저장
-- 자소서 저장
-- GitHub 레포 분석
-- 공고 추가/목록/선택/삭제
+## 테스트
 
-### 면접
+단위 테스트:
 
-- 질문 후보 만들기
-- 선택한 질문으로 면접 시작
-- 다음 질문 또는 전체 평가로 이동
-- 방금 답변 꼬리질문
-- 같은 분야 추가질문
-- 현재 면접 종료
+```bash
+uv run python -m unittest discover -s tests -v
+```
 
-### 공고 관리
+컴파일 확인:
 
-- `/job` 저장된 공고 목록과 사용법 보기
-- `/job add` 다음 메시지로 공고 URL 또는 본문 추가
-- `/job add 공고본문` 공고 바로 추가
-- `/job show` 현재 선택된 공고 요약 보기
-- `/job select 2` 2번 공고를 현재 면접 기준으로 선택
-- `/job delete 2` 2번 공고 삭제
+```bash
+uv run python -m compileall api services db tests scripts
+```
 
-### 보기
+실행 중인 API 대상 smoke:
 
-- `/show_status` 현재 입력 상태 보기
-- `/show_history` 최근 면접 기록 보기
-- `/show_feedback` 최근 전체 면접 피드백 보기
-- `/show_weakness` 최근 약점 요약 보기
-- `/show_github` 저장된 GitHub 상세 분석 보기
-- `/show_analyze` 저장된 통합 상세 분석 보기
+```bash
+uv run python scripts/agent_smoke.py
+```
 
-### 기타
+Gemini 모델 확인:
 
-- 리뷰 탭에서 세션별 질문/답변과 종합 리뷰 확인
-- 입력 초기화는 프로필, 자소서, GitHub 분석, 공고만 삭제하고 면접 기록/피드백/약점 요약은 유지
+```bash
+uv run python scripts/gemini_model_smoke.py
+```
 
-## 민감 데이터 주의
+LLM 포함 전체 시나리오 smoke:
 
-jobis는 로컬 MVP지만, 입력한 자소서와 면접 답변이 다음 위치를 거칩니다.
+```bash
+uv run python scripts/agent_full_scenario_smoke.py --run-llm
+```
 
-- 로컬 웹 브라우저와 FastAPI 서버
-- Gemini 또는 OpenAI API
-- 로컬 Postgres DB
-
-주민등록번호, 전화번호, 주소, 비밀번호, API 키, 회사 내부 정보처럼 민감한 정보는 입력하지 않는 것을 권장합니다.
-
-## 데이터 저장 구조
-
-### 저장되는 것
-
-- 사용자 프로필
-- 자소서
-- GitHub URL과 분석 결과
-- 채용공고 목록, 원본 링크, 요약, 현재 선택된 공고
-- 면접 세션 상태
-- 면접 세션에서 선택한 공고/GitHub 스냅샷
-- 생성된 기본 질문과 보너스 질문
-- 답변 완료된 질문/답변
-- 전체 면접 피드백
-- 약점 요약
-
-### 아직 저장하지 않는 것
-
-- 자소서 입력 대기 같은 일시적인 입력 대기 상태
-- GitHub 분석 같은 LLM 작업이 실행 중이던 상태
-- 개별 답변마다 즉시 생성되는 피드백
-- 전체 피드백의 버전 히스토리
-
-## 서버 재시작 정책
-
-- 진행 중인 면접은 DB의 active 세션으로 복원됩니다.
-- 서버가 꺼져 있는 동안의 브라우저 요청은 처리되지 않습니다.
-- 다시 접속하면 프론트엔드가 현재 세션과 저장 자료를 조회합니다.
-
-## 현재 범위
-
-- 로컬 FastAPI + 웹 프론트엔드 MVP
-- 웹 앱 중심 MVP
-- 로그인 없음. 현재는 `JOBIS_DEFAULT_USER_KEY` 또는 `X-Jobis-User-Key` 요청 헤더로 사용자를 구분합니다.
-- 배포 없음
-- 음성/캠 없음
-- LLM은 Gemini API 기본 사용
-- OpenAI provider 코드도 있으나 기본 provider는 Gemini
-
-## 앞으로 할 일
-
-### 우선순위 높음
-
-- 리뷰 탭에서 저장된 질문/답변 원문 복기 개선
-- reset 기능 분리:
-  - 입력 자료 초기화
-  - 면접 기록까지 전체 초기화
-- 상태 화면에 최근 면접 상태와 최근 피드백 여부 추가
-- 새 면접 시작 시 기존 active 면접 종료 안내 문구 추가
-
-### 품질/최적화
-
-- 리뷰 결과 캐싱
-- GitHub 분석 토큰 최적화
-- 배포 또는 LAN 공유 전에 공고 URL 자동 읽기 SSRF 방어 보강
-  - 현재 로컬 MVP에서는 localhost/내부 IP 직접 입력을 막고 있음
-  - 외부 공개 전에 허용 도메인 방식 또는 연결 단계 IP 검증으로 DNS rebinding까지 방어 필요
-- 질문 구성 커스터마이징
-- 지난 약점 기반 다음 면접 질문 생성
-- 질문 유형별 점수 추이 저장
-
-### 입력 확장
-
-- PDF 자소서 업로드/파싱
-- 여러 GitHub 레포 분석
-- 공고 URL 파싱 개선
-- 텔레그램 음성 메시지 STT
-
-### 장기 계획
-
-- 웹 프론트엔드 추가
-- 음성 면접
-- 캠 기반 신호 분석
-- 사용자별 대시보드
-
-나중에 웹이나 FastAPI API를 붙일 때도 `services/` 안의 GitHub 분석, LLM 호출, 세션 설계 로직은 최대한 재사용합니다.
+전체 시나리오 smoke는 질문 생성, 면접 시작, 답변, 최종 리뷰, 약점 학습, memory 검색까지 확인합니다.

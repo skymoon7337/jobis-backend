@@ -29,6 +29,11 @@ class User(Base):
     job_postings: Mapped[list["JobPostingRecord"]] = relationship(back_populates="user")
     github_projects: Mapped[list["GithubProjectRecord"]] = relationship(back_populates="user")
     analysis_jobs: Mapped[list["AnalysisJobRecord"]] = relationship(back_populates="user")
+    agent_chat_messages: Mapped[list["AgentChatMessageRecord"]] = relationship(back_populates="user")
+    agent_actions: Mapped[list["AgentActionRecord"]] = relationship(back_populates="user")
+    agent_pending_commands: Mapped[list["AgentPendingCommandRecord"]] = relationship(back_populates="user")
+    memory_items: Mapped[list["MemoryItemRecord"]] = relationship(back_populates="user")
+    weakness_items: Mapped[list["WeaknessItemRecord"]] = relationship(back_populates="user")
 
 
 class JobPostingRecord(Base):
@@ -111,6 +116,97 @@ class AnalysisJobRecord(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped[User] = relationship(back_populates="analysis_jobs")
+
+
+class AgentChatMessageRecord(Base):
+    __tablename__ = "agent_chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    role: Mapped[str] = mapped_column(String(30), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    action: Mapped[str] = mapped_column(String(80), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+    user: Mapped[User] = relationship(back_populates="agent_chat_messages")
+
+
+class AgentActionRecord(Base):
+    __tablename__ = "agent_actions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    action: Mapped[str] = mapped_column(String(80), default="", index=True)
+    status: Mapped[str] = mapped_column(String(30), default="", index=True)
+    result_summary: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+    user: Mapped[User] = relationship(back_populates="agent_actions")
+
+
+class AgentPendingCommandRecord(Base):
+    __tablename__ = "agent_pending_commands"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    wait_job_id: Mapped[int] = mapped_column(Integer, index=True)
+    command: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    result_summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="agent_pending_commands")
+
+
+class WeaknessItemRecord(Base):
+    __tablename__ = "weakness_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    topic: Mapped[str] = mapped_column(String(200), default="", index=True)
+    normalized_topic: Mapped[str] = mapped_column(String(220), default="", index=True)
+    category: Mapped[str] = mapped_column(String(80), default="", index=True)
+    weakness_type: Mapped[str] = mapped_column(String(80), default="")
+    severity: Mapped[int] = mapped_column(Integer, default=3)
+    confidence: Mapped[int] = mapped_column(Integer, default=1)
+    evidence: Mapped[str] = mapped_column(Text, default="")
+    suggested_training: Mapped[str] = mapped_column(Text, default="")
+    source_session_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    source_analysis_job_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    occurrence_count: Mapped[int] = mapped_column(Integer, default=1)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+    user: Mapped[User] = relationship(back_populates="weakness_items")
+
+
+class MemoryItemRecord(Base):
+    __tablename__ = "memory_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    source_type: Mapped[str] = mapped_column(String(80), default="", index=True)
+    source_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    title: Mapped[str] = mapped_column(String(240), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    tags_json: Mapped[str] = mapped_column(Text, default="[]")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    user: Mapped[User] = relationship(back_populates="memory_items")
 
 
 class InterviewSession(Base):

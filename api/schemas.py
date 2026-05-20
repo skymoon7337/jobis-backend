@@ -49,6 +49,18 @@ class JobMetaRequest(BaseModel):
         return value.strip()
 
 
+class AgentRequest(BaseModel):
+    message: str = Field(min_length=1)
+
+    @field_validator("message")
+    @classmethod
+    def message_must_not_be_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("message must not be blank")
+        return cleaned
+
+
 class GithubAnalyzeRequest(BaseModel):
     url: str = Field(min_length=1)
 

@@ -4,6 +4,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends
 
 from api.dependencies import request_user_key
 from api.schemas import (
+    AgentRequest,
     GithubAliasRequest,
     GithubAnalyzeRequest,
     InterviewAnswerRequest,
@@ -14,9 +15,16 @@ from api.schemas import (
     ProfileRequest,
     ResumeRequest,
 )
+from services.agent import (
+    agent_actions_payload,
+    agent_chat_messages_payload,
+    agent_pending_commands_payload,
+    handle_agent_message,
+)
 from services.workflow import (
     create_bonus_question_job,
     create_github_analysis_job,
+    create_context_analysis_job,
     create_final_review_job,
     create_job_posting_job,
     create_question_plan_job,
@@ -43,6 +51,7 @@ from services.workflow import (
     select_job,
     start_interview,
     run_github_analysis_job,
+    run_context_analysis_job,
     run_final_review_job,
     run_job_posting_job,
     run_question_plan_job,
@@ -54,6 +63,45 @@ from services.workflow import (
 
 router = APIRouter(prefix="/api")
 UserKey = Annotated[str, Depends(request_user_key)]
+
+
+@router.post("/agent")
+async def agent(payload: AgentRequest, background_tasks: BackgroundTasks, user_key: UserKey) -> dict:
+    return await handle_agent_message(
+        payload.message,
+        user_key=user_key,
+        background_tasks=background_tasks,
+    )
+
+
+@router.get("/agent/messages")
+def agent_messages(user_key: UserKey, limit: int = 50) -> dict:
+    return {
+        "messages": ["최근 에이전트 채팅 기록입니다."],
+        "status": get_status(user_key).status,
+        "data": agent_chat_messages_payload(user_key, limit),
+        "ok": True,
+    }
+
+
+@router.get("/agent/actions")
+def agent_actions(user_key: UserKey, limit: int = 50) -> dict:
+    return {
+        "messages": ["최근 에이전트 실행 기록입니다."],
+        "status": get_status(user_key).status,
+        "data": agent_actions_payload(user_key, limit),
+        "ok": True,
+    }
+
+
+@router.get("/agent/pending")
+def agent_pending_commands(user_key: UserKey, limit: int = 50) -> dict:
+    return {
+        "messages": ["예약된 에이전트 이어 실행 목록입니다."],
+        "status": get_status(user_key).status,
+        "data": agent_pending_commands_payload(user_key, limit),
+        "ok": True,
+    }
 
 
 @router.get("/status")
@@ -69,6 +117,18 @@ def context_latest(user_key: UserKey) -> dict:
 @router.post("/context/reset")
 def context_reset(user_key: UserKey) -> dict:
     return reset_context(user_key).to_dict()
+
+
+@router.post("/context/analyze-jobs")
+async def context_analyze_job(background_tasks: BackgroundTasks, user_key: UserKey) -> dict:
+    result, should_start = create_context_analysis_job(user_key)
+    if should_start and result.data.get("job"):
+        background_tasks.add_task(
+            run_context_analysis_job,
+            result.data["job"]["id"],
+            user_key,
+        )
+    return result.to_dict()
 
 
 @router.post("/profile")

@@ -3,10 +3,12 @@ from db.repository import (
     create_job_posting,
     delete_job_posting,
     get_active_analysis_job,
+    get_latest_completed_analysis_job_by_input,
     get_job_posting_by_index,
     get_job_postings,
     get_selected_job_posting,
     load_user_session,
+    save_agent_chat_message,
     select_job_posting,
     update_analysis_job,
     update_job_posting_content,
@@ -49,6 +51,7 @@ def create_job_posting_job(
     text_or_url: str,
     user_key: str | None = None,
     replace_index: int | None = None,
+    force: bool = False,
 ) -> tuple[WorkflowResult, bool]:
     resolved_user_key = user_key or default_user_key()
     blocked = ensure_context_mutable(resolved_user_key)
@@ -81,6 +84,24 @@ def create_job_posting_job(
             False,
         )
 
+    input_data = {"text": text, "replace_index": replace_index}
+    if not force:
+        cached_job = get_latest_completed_analysis_job_by_input(
+            resolved_user_key,
+            JOB_POSTING_JOB_KIND,
+            input_data,
+        )
+        if cached_job:
+            session = load_user_session(resolved_user_key)
+            return (
+                WorkflowResult(
+                    messages=["같은 공고 입력으로 만든 기존 분석 결과를 불러왔습니다."],
+                    status=session_status(session, user_key=resolved_user_key),
+                    data={"job": cached_job, "cached": True},
+                ),
+                False,
+            )
+
     active_job = get_active_analysis_job(resolved_user_key, JOB_POSTING_JOB_KIND)
     if active_job:
         session = load_user_session(resolved_user_key)
@@ -96,7 +117,7 @@ def create_job_posting_job(
     job = create_analysis_job(
         resolved_user_key,
         kind=JOB_POSTING_JOB_KIND,
-        input_data={"text": text, "replace_index": replace_index},
+        input_data=input_data,
         stage="queued",
         message="공고 수정을 준비하고 있습니다." if replace_index else "공고 분석을 준비하고 있습니다.",
         progress_current=0,
@@ -197,10 +218,37 @@ async def run_job_posting_job(
             result_data=jobs_payload(user_key),
             finished=True,
         )
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content="공고 수정이 완료됐어." if replace_index else "공고 분석이 완료됐어.",
+            action="job_posting_completed",
+        )
+        from services.agent import run_pending_agent_commands_for_job
+
+        await run_pending_agent_commands_for_job(user_key, job_id)
     except ValueError as exc:
         fail_job_posting_job(job_id, "parse_error", str(exc))
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"공고 분석에 실패했어.\n\n{str(exc)[:500]}",
+            action="job_posting_failed",
+        )
+        from services.agent import fail_pending_agent_commands_for_job
+
+        fail_pending_agent_commands_for_job(user_key, job_id, str(exc))
     except Exception as exc:
         fail_job_posting_job(job_id, classify_job_posting_error(exc), str(exc))
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"공고 분석에 실패했어.\n\n{str(exc)[:500]}",
+            action="job_posting_failed",
+        )
+        from services.agent import fail_pending_agent_commands_for_job
+
+        fail_pending_agent_commands_for_job(user_key, job_id, str(exc))
 
 
 def fail_job_posting_job(job_id: int, error_type: str, error_message: str) -> None:

@@ -83,6 +83,93 @@ def migrate_dev_schema() -> None:
         "CREATE INDEX IF NOT EXISTS ix_analysis_jobs_user_id ON analysis_jobs (user_id)",
         "CREATE INDEX IF NOT EXISTS ix_analysis_jobs_kind ON analysis_jobs (kind)",
         "CREATE INDEX IF NOT EXISTS ix_analysis_jobs_status ON analysis_jobs (status)",
+        """
+        CREATE TABLE IF NOT EXISTS agent_chat_messages (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id),
+            role VARCHAR(30) DEFAULT '',
+            content TEXT DEFAULT '',
+            action VARCHAR(80) DEFAULT '',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_agent_chat_messages_id ON agent_chat_messages (id)",
+        "CREATE INDEX IF NOT EXISTS ix_agent_chat_messages_user_id ON agent_chat_messages (user_id)",
+        """
+        CREATE TABLE IF NOT EXISTS agent_actions (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id),
+            action VARCHAR(80) DEFAULT '',
+            status VARCHAR(30) DEFAULT '',
+            result_summary TEXT DEFAULT '',
+            metadata_json TEXT DEFAULT '{}',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_agent_actions_id ON agent_actions (id)",
+        "CREATE INDEX IF NOT EXISTS ix_agent_actions_user_id ON agent_actions (user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_agent_actions_action ON agent_actions (action)",
+        "CREATE INDEX IF NOT EXISTS ix_agent_actions_status ON agent_actions (status)",
+        """
+        CREATE TABLE IF NOT EXISTS agent_pending_commands (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id),
+            wait_job_id INTEGER DEFAULT 0,
+            command TEXT DEFAULT '',
+            status VARCHAR(30) DEFAULT 'pending',
+            result_summary TEXT DEFAULT '',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            finished_at TIMESTAMP WITH TIME ZONE
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_agent_pending_commands_id ON agent_pending_commands (id)",
+        "CREATE INDEX IF NOT EXISTS ix_agent_pending_commands_user_id ON agent_pending_commands (user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_agent_pending_commands_wait_job_id ON agent_pending_commands (wait_job_id)",
+        "CREATE INDEX IF NOT EXISTS ix_agent_pending_commands_status ON agent_pending_commands (status)",
+        """
+        CREATE TABLE IF NOT EXISTS weakness_items (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id),
+            topic VARCHAR(200) DEFAULT '',
+            normalized_topic VARCHAR(220) DEFAULT '',
+            category VARCHAR(80) DEFAULT '',
+            weakness_type VARCHAR(80) DEFAULT '',
+            severity INTEGER DEFAULT 3,
+            confidence INTEGER DEFAULT 1,
+            evidence TEXT DEFAULT '',
+            suggested_training TEXT DEFAULT '',
+            source_session_ids_json TEXT DEFAULT '[]',
+            source_analysis_job_ids_json TEXT DEFAULT '[]',
+            occurrence_count INTEGER DEFAULT 1,
+            first_seen_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_weakness_items_id ON weakness_items (id)",
+        "CREATE INDEX IF NOT EXISTS ix_weakness_items_user_id ON weakness_items (user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_weakness_items_topic ON weakness_items (topic)",
+        "CREATE INDEX IF NOT EXISTS ix_weakness_items_normalized_topic ON weakness_items (normalized_topic)",
+        "CREATE INDEX IF NOT EXISTS ix_weakness_items_category ON weakness_items (category)",
+        """
+        CREATE TABLE IF NOT EXISTS memory_items (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id),
+            source_type VARCHAR(80) DEFAULT '',
+            source_id INTEGER DEFAULT 0,
+            title VARCHAR(240) DEFAULT '',
+            content TEXT DEFAULT '',
+            summary TEXT DEFAULT '',
+            tags_json TEXT DEFAULT '[]',
+            metadata_json TEXT DEFAULT '{}',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_memory_items_id ON memory_items (id)",
+        "CREATE INDEX IF NOT EXISTS ix_memory_items_user_id ON memory_items (user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_memory_items_source_type ON memory_items (source_type)",
+        "CREATE INDEX IF NOT EXISTS ix_memory_items_source_id ON memory_items (source_id)",
     ]
     with engine.begin() as connection:
         for statement in statements:

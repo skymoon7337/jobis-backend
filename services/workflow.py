@@ -7,6 +7,11 @@ from services.workflow_common import (
     session_status,
 )
 from services.workflow_context import context_payload, get_context, reset_context, save_profile, save_resume
+from services.workflow_context_analysis import (
+    CONTEXT_ANALYSIS_JOB_KIND,
+    create_context_analysis_job,
+    run_context_analysis_job,
+)
 from services.workflow_github import (
     create_github_analysis_job,
     get_github_analysis,
@@ -46,6 +51,7 @@ from services.workflow_interview import (
     run_bonus_question_job,
     run_question_plan_job,
     run_final_review_job,
+    search_interview_history,
     skip_interview_question,
     start_interview,
     strip_question_label,
@@ -54,6 +60,14 @@ from services.workflow_interview import (
 )
 from services.workflow_jobs import jobs_payload, list_jobs, remove_job, rename_job, select_job, update_job_meta
 from services.workflow_jobs import create_job_posting_job, run_job_posting_job
+from services.workflow_weakness import (
+    get_memory_learning,
+    get_weakness_learning,
+    record_final_review_memory,
+    record_interview_turn_memory,
+    record_weakness_learning_from_review,
+    reset_learning_data,
+)
 
 
 __all__ = [
@@ -64,10 +78,12 @@ __all__ = [
     "build_choice_options",
     "complete_interview",
     "context_payload",
+    "CONTEXT_ANALYSIS_JOB_KIND",
     "create_bonus_question_job",
     "create_github_analysis_job",
     "create_final_review_job",
     "create_job_posting_job",
+    "create_context_analysis_job",
     "create_question_plan_job",
     "end_interview",
     "extract_weakness_summary",
@@ -82,6 +98,8 @@ __all__ = [
     "get_interview_review",
     "get_llm",
     "get_status",
+    "get_memory_learning",
+    "get_weakness_learning",
     "github_payload",
     "interview_payload",
     "interview_review_payload",
@@ -98,6 +116,10 @@ __all__ = [
     "read_active_analysis_job",
     "read_active_analysis_jobs",
     "read_analysis_job",
+    "record_weakness_learning_from_review",
+    "record_final_review_memory",
+    "record_interview_turn_memory",
+    "reset_learning_data",
     "remove_job",
     "rename_job",
     "update_job_meta",
@@ -109,7 +131,9 @@ __all__ = [
     "run_github_analysis_job",
     "run_final_review_job",
     "run_job_posting_job",
+    "run_context_analysis_job",
     "run_question_plan_job",
+    "search_interview_history",
     "save_profile",
     "save_resume",
     "select_job",

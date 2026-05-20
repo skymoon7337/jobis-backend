@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from db.repository import (
@@ -7,12 +8,16 @@ from db.repository import (
     get_active_analysis_job,
     get_active_interview_snapshot,
     get_github_repositories_by_indices,
+    get_latest_completed_analysis_job_by_input,
     get_job_posting_by_index,
     get_latest_feedback_summary,
     get_latest_weakness_summary,
+    get_memory_items,
     get_recent_sessions,
     get_recent_turns,
+    get_weakness_items,
     load_user_session,
+    save_agent_chat_message,
     save_interview_question,
     save_interview_questions,
     save_interview_turn,
@@ -28,6 +33,11 @@ from services.workflow_common import (
     get_llm,
     default_user_key,
     session_status,
+)
+from services.workflow_weakness import (
+    record_final_review_memory,
+    record_interview_turn_memory,
+    record_weakness_learning_from_review,
 )
 
 QUESTION_TYPES = ("CS 기본기", "언어", "기술스택", "프로젝트/GitHub", "프로젝트/자소서")
@@ -156,6 +166,7 @@ def create_question_plan_job(
     github_indices: list[int] | None = None,
     question_counts: dict[str, int] | None = None,
     user_key: str | None = None,
+    force: bool = False,
 ) -> tuple[WorkflowResult, bool]:
     resolved_user_key = user_key or default_user_key()
     selected_github_indices = github_indices or []
@@ -201,6 +212,32 @@ def create_question_plan_job(
             False,
         )
 
+    selected_job = get_job_posting_by_index(resolved_user_key, job_index)
+    selected_repositories = get_github_repositories_by_indices(resolved_user_key, selected_github_indices)
+    input_data = {
+        "job_index": job_index,
+        "job_id": selected_job["id"] if selected_job else None,
+        "github_indices": selected_github_indices,
+        "github_snapshot_ids": [repository.get("snapshot_id") for repository in selected_repositories],
+        "question_counts": question_counts or {},
+        "question_plan": question_plan,
+    }
+    if not force:
+        cached_job = get_latest_completed_analysis_job_by_input(
+            resolved_user_key,
+            QUESTION_PLAN_JOB_KIND,
+            input_data,
+        )
+        if cached_job:
+            return (
+                WorkflowResult(
+                    messages=["같은 공고와 GitHub 구성으로 만든 기존 질문 후보를 불러왔습니다."],
+                    status=session_status(session, user_key=resolved_user_key),
+                    data={"job": cached_job, "cached": True},
+                ),
+                False,
+            )
+
     active_job = get_active_analysis_job(resolved_user_key, QUESTION_PLAN_JOB_KIND)
     if active_job:
         return (
@@ -215,12 +252,7 @@ def create_question_plan_job(
     job = create_analysis_job(
         resolved_user_key,
         kind=QUESTION_PLAN_JOB_KIND,
-        input_data={
-            "job_index": job_index,
-            "github_indices": selected_github_indices,
-            "question_counts": question_counts or {},
-            "question_plan": question_plan,
-        },
+        input_data=input_data,
         stage="queued",
         message="질문 후보 생성을 준비하고 있습니다.",
         progress_current=0,
@@ -305,10 +337,37 @@ async def run_question_plan_job(
             result_data=question_candidate_payload(questions),
             finished=True,
         )
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"질문 후보 {len(questions)}개를 만들었어.",
+            action="question_plan_completed",
+        )
+        from services.agent import run_pending_agent_commands_for_job
+
+        await run_pending_agent_commands_for_job(user_key, job_id)
     except ValueError as exc:
         fail_question_plan_job(job_id, "parse_error", str(exc))
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"질문 후보 생성에 실패했어.\n\n{str(exc)[:500]}",
+            action="question_plan_failed",
+        )
+        from services.agent import fail_pending_agent_commands_for_job
+
+        fail_pending_agent_commands_for_job(user_key, job_id, str(exc))
     except Exception as exc:
         fail_question_plan_job(job_id, classify_question_plan_error(exc), str(exc))
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"질문 후보 생성에 실패했어.\n\n{str(exc)[:500]}",
+            action="question_plan_failed",
+        )
+        from services.agent import fail_pending_agent_commands_for_job
+
+        fail_pending_agent_commands_for_job(user_key, job_id, str(exc))
 
 
 def fail_question_plan_job(job_id: int, error_type: str, error_message: str) -> None:
@@ -474,6 +533,21 @@ async def run_final_review_job(job_id: int, user_key: str) -> None:
             summary=result,
             weakness_summary=weakness_summary,
         )
+        learned_weaknesses = record_weakness_learning_from_review(
+            user_key,
+            session_id=session.active_interview_session_id,
+            analysis_job_id=job_id,
+            weakness_summary=weakness_summary,
+            overall_feedback=overall_feedback or result,
+        )
+        review_memory = record_final_review_memory(
+            user_key,
+            session_id=session.active_interview_session_id,
+            analysis_job_id=job_id,
+            answer_feedback=answer_feedback,
+            overall_feedback=overall_feedback or "",
+            weakness_summary=weakness_summary,
+        )
         update_analysis_job(
             job_id,
             status="completed",
@@ -486,13 +560,33 @@ async def run_final_review_job(job_id: int, user_key: str) -> None:
                 "overall_feedback": overall_feedback,
                 "interview": interview_payload(user_key),
                 "review": interview_review_payload(user_key),
+                "learned_weaknesses": learned_weaknesses,
+                "review_memory": review_memory,
             },
             finished=True,
         )
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=overall_feedback or answer_feedback or "면접 리뷰가 완료되었습니다.",
+            action="final_review_completed",
+        )
     except ValueError as exc:
         fail_final_review_job(job_id, "validation_error", str(exc))
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"리뷰 생성에 실패했습니다.\n\n{str(exc)[:500]}",
+            action="final_review_failed",
+        )
     except Exception as exc:
         fail_final_review_job(job_id, classify_final_review_error(exc), str(exc))
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"리뷰 생성에 실패했습니다.\n\n{str(exc)[:500]}",
+            action="final_review_failed",
+        )
 
 
 def fail_final_review_job(job_id: int, error_type: str, error_message: str) -> None:
@@ -751,6 +845,8 @@ def interview_review_payload(user_key: str) -> dict[str, Any]:
         "answer_feedback": answer_feedback,
         "overall_feedback": overall_feedback or "",
         "latest_weakness": get_latest_weakness_summary(user_key),
+        "weaknesses": get_weakness_items(user_key),
+        "memories": get_memory_items(user_key, limit=8),
     }
 
 
@@ -775,6 +871,428 @@ def get_interview_review(user_key: str | None = None) -> WorkflowResult:
         messages=[message],
         status=session_status(session, user_key=resolved_user_key),
         data=payload,
+    )
+
+
+def _normalize_history_search_text(value: str) -> str:
+    normalized = value.lower()
+    normalized = re.sub(r"web\s*socket", "websocket", normalized)
+    normalized = re.sub(r"웹\s*소켓", "웹소켓", normalized)
+    normalized = re.sub(r"[\s\-_./:：,，?？!()\[\]{}'\"`]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _history_search_keywords(query: str) -> list[str]:
+    stopwords = {"관련", "있는", "있던", "있었던", "것만", "최근", "면접", "기록", "찾아줘"}
+    normalized = _normalize_history_search_text(query)
+    keywords = [
+        keyword
+        for keyword in normalized.split()
+        if len(keyword) >= 2 and keyword not in stopwords
+    ]
+    normalized_phrase = " ".join(keywords)
+    if len(keywords) > 1 and normalized_phrase not in keywords:
+        keywords.insert(0, normalized_phrase)
+    return list(dict.fromkeys(keywords))[:8]
+
+
+def _history_search_query_filters(query: str) -> tuple[str, dict[str, Any]]:
+    cleaned = query.strip()
+    filters: dict[str, Any] = {}
+
+    if re.search(r"(답변|피드백).*(있는|있던|있었|포함|만)", cleaned):
+        filters["answered_only"] = True
+        cleaned = re.sub(r"(답변|피드백)\s*(피드백)?\s*(있는|있던|있었던|포함|만|있는\s*것만)?", " ", cleaned)
+        cleaned = re.sub(r"\b(있는|있던|있었던|것만)\b", " ", cleaned)
+
+    week_match = re.search(r"최근\s*(\d+)\s*주", cleaned)
+    month_match = re.search(r"최근\s*(\d+)\s*(개월|달)", cleaned)
+    if week_match:
+        filters["recent_days"] = int(week_match.group(1)) * 7
+        cleaned = cleaned.replace(week_match.group(0), " ")
+    elif month_match:
+        filters["recent_days"] = int(month_match.group(1)) * 30
+        cleaned = cleaned.replace(month_match.group(0), " ")
+    elif re.search(r"최근\s*(한|1)\s*(개월|달)", cleaned):
+        filters["recent_days"] = 30
+        cleaned = re.sub(r"최근\s*(한|1)\s*(개월|달)", " ", cleaned)
+
+    cleaned = re.sub(r"\b(관련|있는|있던|있었던|것만)\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned, filters
+
+
+def _entry_matches_history_filters(entry: dict[str, Any], filters: dict[str, Any]) -> bool:
+    if filters.get("answered_only") and entry.get("source_type") not in {"turn", "review"}:
+        return False
+
+    recent_days = filters.get("recent_days")
+    if isinstance(recent_days, int) and recent_days > 0:
+        created_at = entry.get("created_at")
+        if not isinstance(created_at, datetime):
+            return False
+        now = datetime.now(created_at.tzinfo) if created_at.tzinfo else datetime.now()
+        if created_at < now - timedelta(days=recent_days):
+            return False
+
+    return True
+
+
+def _excerpt_around_keyword(text: str, keywords: list[str], max_length: int = 180) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= max_length:
+        return compact
+
+    normalized = _normalize_history_search_text(compact)
+    first_index = -1
+    for keyword in keywords:
+        index = normalized.find(keyword)
+        if index >= 0 and (first_index < 0 or index < first_index):
+            first_index = index
+
+    if first_index < 0:
+        return f"{compact[:max_length].rstrip()}..."
+
+    start = max(0, first_index - 60)
+    end = min(len(compact), start + max_length)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(compact) else ""
+    return f"{prefix}{compact[start:end].strip()}{suffix}"
+
+
+def _review_feedback_entries(session_label: str, session_id: int, review_text: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    blocks = [
+        block.strip()
+        for block in re.split(r"\n\s*-{5,}\s*\n|문항별 피드백", review_text)
+        if block.strip()
+    ]
+    for block in blocks:
+        display_match = re.search(r"(?:▶\s*)?(\d+-\d+(?:-f\d+)?)", block)
+        if not display_match:
+            continue
+        display_id = display_match.group(1)
+        entries.append(
+            {
+                "source_type": "review",
+                "session_id": session_id,
+                "display_id": display_id,
+                "title": f"{session_label} {display_id} 최종 리뷰".strip(),
+                "content": block,
+            }
+        )
+    return entries
+
+
+def _history_entry_priority(source_type: str) -> int:
+    priorities = {
+        "turn": 3,
+        "question": 2,
+        "review": 1,
+    }
+    return priorities.get(source_type, 0)
+
+
+INTERVIEW_HISTORY_INITIAL_LIMIT = 4
+INTERVIEW_HISTORY_NEXT_LIMIT = 4
+
+
+def _compact_filter_value(value: str, max_length: int = 28) -> str:
+    compact = re.sub(r"\s+", " ", value).strip()
+    return compact if len(compact) <= max_length else f"{compact[:max_length].rstrip()}..."
+
+
+def _session_github_labels(session_item: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+    for repository in session_item.get("github_repositories", []):
+        if not isinstance(repository, dict):
+            continue
+        label = (
+            str(repository.get("display_name") or "")
+            or str(repository.get("alias") or "")
+            or str(repository.get("title") or "")
+            or str(repository.get("repo_key") or "")
+        ).strip()
+        if label:
+            labels.append(label)
+    return list(dict.fromkeys(labels))
+
+
+def _history_filter_suggestions(query: str, matches: list[dict[str, Any]]) -> list[dict[str, str]]:
+    suggestions: list[dict[str, str]] = []
+    cleaned_query = query.strip()
+
+    def add(label: str, prompt: str) -> None:
+        if label and prompt and all(item["label"] != label for item in suggestions):
+            suggestions.append({"label": label, "prompt": prompt})
+
+    add("최근 2주", f"{cleaned_query} 최근 2주 면접 기록 찾아줘")
+
+    job_titles = [
+        str(match.get("job_title") or "").strip()
+        for match in matches
+        if str(match.get("job_title") or "").strip()
+    ]
+    for job_title in list(dict.fromkeys(job_titles))[:2]:
+        label = _compact_filter_value(job_title)
+        add(label, f"{cleaned_query} {job_title} 면접 기록 찾아줘")
+
+    github_labels: list[str] = []
+    for match in matches:
+        github_labels.extend(
+            label for label in match.get("github_labels", []) if isinstance(label, str) and label
+        )
+    for github_label in list(dict.fromkeys(github_labels))[:2]:
+        label = _compact_filter_value(github_label)
+        add(label, f"{cleaned_query} {github_label} GitHub 면접 기록 찾아줘")
+
+    add("답변 있는 것만", f"{cleaned_query} 답변 피드백 있는 면접 기록 찾아줘")
+    return suggestions[:5]
+
+
+def _merge_history_search_matches(scored: list[tuple[int, dict[str, Any]]], keywords: list[str]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[int, str], dict[str, Any]] = {}
+    source_labels = {
+        "question": "질문",
+        "review": "최종 리뷰",
+        "turn": "답변/피드백",
+    }
+    source_order = ["question", "turn", "review"]
+
+    for score, entry in sorted(scored, key=lambda item: item[0], reverse=True):
+        session_id = int(entry.get("session_id") or 0)
+        display_id = str(entry.get("display_id") or "")
+        source_type = str(entry.get("source_type") or "")
+        group_key = (session_id, display_id or source_type)
+        current = grouped.get(group_key)
+        source_label = source_labels.get(source_type, source_type or "기록")
+
+        if not current:
+            grouped[group_key] = {
+                "entry": entry,
+                "score": score,
+                "source_types": [source_type],
+                "sources": [source_label],
+            }
+            continue
+
+        current["score"] += score
+        if source_type not in current["source_types"]:
+            current["source_types"].append(source_type)
+            current["sources"].append(source_label)
+
+        current_entry = current["entry"]
+        if _history_entry_priority(source_type) > _history_entry_priority(str(current_entry.get("source_type") or "")):
+            current["entry"] = entry
+
+    matches: list[dict[str, Any]] = []
+    for item in sorted(grouped.values(), key=lambda value: value["score"], reverse=True):
+        entry = item["entry"]
+        source_type = str(entry.get("source_type") or "")
+        ordered_source_types = [
+            source
+            for source in source_order
+            if source in item["source_types"]
+        ] + [
+            source
+            for source in item["source_types"]
+            if source not in source_order
+        ]
+        matches.append(
+            {
+                "source_type": source_type,
+                "source_types": ordered_source_types,
+                "sources": [source_labels.get(source, source or "기록") for source in ordered_source_types],
+                "session_id": entry["session_id"],
+                "display_id": entry["display_id"],
+                "title": entry["title"],
+                "excerpt": _excerpt_around_keyword(str(entry.get("content") or ""), keywords),
+                "job_title": entry.get("job_title") or "",
+                "created_at": entry.get("created_at"),
+                "github_labels": entry.get("github_labels") or [],
+                "score": item["score"],
+            }
+        )
+
+    return matches
+
+
+def search_interview_history(user_key: str | None = None, *, query: str = "") -> WorkflowResult:
+    resolved_user_key = user_key or default_user_key()
+    session = load_user_session(resolved_user_key)
+    sessions = get_recent_sessions(resolved_user_key, limit=50)
+    cleaned_query, filters = _history_search_query_filters(query)
+    keywords = _history_search_keywords(cleaned_query)
+    searched_counts = {"sessions": len(sessions), "questions": 0, "turns": 0, "reviews": 0}
+    entries: list[dict[str, Any]] = []
+
+    for session_item in sessions:
+        session_id = int(session_item.get("id") or 0)
+        session_label = f"세션 #{session_id}"
+        job_title = str(session_item.get("job_title") or "").strip()
+        github_labels = _session_github_labels(session_item)
+        session_meta_text = "\n".join(
+            part
+            for part in (
+                job_title,
+                " ".join(github_labels),
+            )
+            if part.strip()
+        )
+        created_at = session_item.get("created_at")
+        for question in session_item.get("questions", []):
+            searched_counts["questions"] += 1
+            display_id = str(question.get("display_id") or "")
+            question_type = str(question.get("question_type") or "")
+            question_text = str(question.get("question") or "")
+            entries.append(
+                {
+                    "source_type": "question",
+                    "session_id": session_id,
+                    "display_id": display_id,
+                    "title": f"{session_label} {display_id} 질문".strip(),
+                    "content": f"{question_type}\n{question_text}",
+                    "search_text": f"{session_meta_text}\n{question_type}\n{question_text}",
+                    "job_title": job_title,
+                    "created_at": created_at,
+                    "github_labels": github_labels,
+                }
+            )
+
+        for turn in session_item.get("turns", []):
+            searched_counts["turns"] += 1
+            display_id = str(turn.get("display_id") or "")
+            question_type = str(turn.get("question_type") or "")
+            entries.append(
+                {
+                    "source_type": "turn",
+                    "session_id": session_id,
+                    "display_id": display_id,
+                    "title": f"{session_label} {display_id} 답변/피드백".strip(),
+                    "content": (
+                        f"{question_type}\n"
+                        f"질문: {turn.get('question') or ''}\n"
+                        f"답변: {turn.get('answer') or ''}\n"
+                        f"피드백: {turn.get('feedback') or ''}"
+                    ),
+                    "search_text": (
+                        f"{session_meta_text}\n"
+                        f"{question_type}\n"
+                        f"질문: {turn.get('question') or ''}\n"
+                        f"답변: {turn.get('answer') or ''}\n"
+                        f"피드백: {turn.get('feedback') or ''}"
+                    ),
+                    "job_title": job_title,
+                    "created_at": created_at,
+                    "github_labels": github_labels,
+                }
+            )
+
+        review_text = "\n".join(
+            part
+            for part in (
+                str(session_item.get("summary") or ""),
+                str(session_item.get("weakness_summary") or ""),
+            )
+            if part.strip()
+        )
+        if review_text:
+            searched_counts["reviews"] += 1
+            review_entries = _review_feedback_entries(session_label, session_id, review_text)
+            if review_entries:
+                for entry in review_entries:
+                    entry["search_text"] = f"{session_meta_text}\n{entry.get('content') or ''}"
+                    entry["job_title"] = job_title
+                    entry["created_at"] = created_at
+                    entry["github_labels"] = github_labels
+                entries.extend(review_entries)
+            else:
+                entries.append(
+                    {
+                        "source_type": "review",
+                        "session_id": session_id,
+                        "display_id": "",
+                        "title": f"{session_label} 최종 리뷰",
+                        "content": review_text,
+                        "search_text": f"{session_meta_text}\n{review_text}",
+                        "job_title": job_title,
+                        "created_at": created_at,
+                        "github_labels": github_labels,
+                    }
+                )
+
+    scored: list[tuple[int, dict[str, Any]]] = []
+    if keywords:
+        for entry in entries:
+            if not _entry_matches_history_filters(entry, filters):
+                continue
+            searchable_content = entry.get("search_text") or entry.get("content") or ""
+            haystack = _normalize_history_search_text(
+                f"{entry.get('title') or ''}\n{searchable_content}"
+            )
+            score = sum(haystack.count(keyword) for keyword in keywords)
+            if score > 0:
+                scored.append((score, entry))
+
+    matches = _merge_history_search_matches(scored, keywords)
+
+    searched_label = (
+        f"질문 {searched_counts['questions']}개, 답변/피드백 {searched_counts['turns']}개, "
+        f"최종 리뷰 {searched_counts['reviews']}개"
+    )
+    total_count = len(matches)
+    visible_matches = matches[:INTERVIEW_HISTORY_INITIAL_LIMIT]
+    next_matches = matches[
+        INTERVIEW_HISTORY_INITIAL_LIMIT:INTERVIEW_HISTORY_INITIAL_LIMIT + INTERVIEW_HISTORY_NEXT_LIMIT
+    ]
+    display_query = cleaned_query or query.strip() or "검색어 없음"
+    if not visible_matches:
+        return WorkflowResult(
+            messages=[
+                (
+                    f"`{display_query}` 관련 면접 기록을 찾지 못했어.\n\n"
+                    f"검색 범위: {searched_label}\n"
+                    "최근 리뷰로 임의 이동하지 않았고, 검색 결과가 없다는 상태로 남겨둘게."
+                )
+            ],
+            status=session_status(session, user_key=resolved_user_key),
+            data={
+                "query": display_query,
+                "matches": [],
+                "match_count": 0,
+                "total_count": 0,
+                "shown_count": 0,
+                "has_more": False,
+                "next_matches": [],
+                "refine_suggestions": [],
+                "searched_counts": searched_counts,
+                "target_view": "review",
+            },
+        )
+
+    has_more = total_count > len(visible_matches)
+    return WorkflowResult(
+        messages=[
+            (
+                f"`{display_query}` 관련 면접 문항 {total_count}개를 찾았어. "
+                f"관련도가 높은 {len(visible_matches)}개를 먼저 보여줄게.\n\n"
+                "더 보거나 조건을 좁혀서 다시 찾을 수 있어."
+            )
+        ],
+        status=session_status(session, user_key=resolved_user_key),
+        data={
+            "query": display_query,
+            "matches": visible_matches,
+            "match_count": len(visible_matches),
+            "total_count": total_count,
+            "shown_count": len(visible_matches),
+            "has_more": has_more,
+            "next_matches": next_matches,
+            "refine_suggestions": _history_filter_suggestions(display_query, matches),
+            "searched_counts": searched_counts,
+            "target_view": "review",
+            "selected_session_id": visible_matches[0]["session_id"],
+        },
     )
 
 
@@ -972,7 +1490,7 @@ def submit_interview_answer(answer: str, user_key: str | None = None) -> Workflo
     if not is_bonus:
         session.turn_count += 1
 
-    save_interview_turn(
+    saved_turn = save_interview_turn(
         session.active_interview_session_id,
         question_type=session.current_question_type,
         question=question,
@@ -981,6 +1499,11 @@ def submit_interview_answer(answer: str, user_key: str | None = None) -> Workflo
         display_id=session.current_display_id,
         is_bonus=is_bonus,
         bonus_type=session.current_bonus_type if is_bonus else "",
+    )
+    record_interview_turn_memory(
+        resolved_user_key,
+        turn=saved_turn,
+        session_id=session.active_interview_session_id,
     )
     update_interview_session(
         session.active_interview_session_id,
@@ -1022,7 +1545,7 @@ def skip_interview_question(user_key: str | None = None) -> WorkflowResult:
         )
 
     is_bonus = session.current_question_is_bonus
-    save_interview_turn(
+    saved_turn = save_interview_turn(
         session.active_interview_session_id,
         question_type=session.current_question_type,
         question=question,
@@ -1031,6 +1554,11 @@ def skip_interview_question(user_key: str | None = None) -> WorkflowResult:
         display_id=session.current_display_id,
         is_bonus=is_bonus,
         bonus_type=session.current_bonus_type if is_bonus else "",
+    )
+    record_interview_turn_memory(
+        resolved_user_key,
+        turn=saved_turn,
+        session_id=session.active_interview_session_id,
     )
     update_interview_session(
         session.active_interview_session_id,
@@ -1241,10 +1769,28 @@ async def run_bonus_question_job(job_id: int, user_key: str, mode: str) -> None:
             result_data={"interview": interview_payload(user_key), "mode": mode},
             finished=True,
         )
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=format_bonus_question(last_turn.question_type, bonus_question, mode, display_id),
+            action="bonus_question_completed",
+        )
     except ValueError as exc:
         fail_bonus_question_job(job_id, "validation_error", str(exc))
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"질문 생성에 실패했습니다.\n\n{str(exc)[:500]}",
+            action="bonus_question_failed",
+        )
     except Exception as exc:
         fail_bonus_question_job(job_id, classify_bonus_question_error(exc), str(exc))
+        save_agent_chat_message(
+            user_key,
+            role="assistant",
+            content=f"질문 생성에 실패했습니다.\n\n{str(exc)[:500]}",
+            action="bonus_question_failed",
+        )
 
 
 def fail_bonus_question_job(job_id: int, error_type: str, error_message: str) -> None:
@@ -1332,6 +1878,21 @@ async def complete_interview(user_key: str) -> WorkflowResult:
         summary=result,
         weakness_summary=weakness_summary,
     )
+    learned_weaknesses = record_weakness_learning_from_review(
+        user_key,
+        session_id=session.active_interview_session_id,
+        analysis_job_id=None,
+        weakness_summary=weakness_summary,
+        overall_feedback=overall_feedback or result,
+    )
+    review_memory = record_final_review_memory(
+        user_key,
+        session_id=session.active_interview_session_id,
+        analysis_job_id=None,
+        answer_feedback=answer_feedback,
+        overall_feedback=overall_feedback or "",
+        weakness_summary=weakness_summary,
+    )
     session = load_user_session(user_key)
     messages = [answer_feedback]
     if overall_feedback:
@@ -1341,5 +1902,9 @@ async def complete_interview(user_key: str) -> WorkflowResult:
     return WorkflowResult(
         messages=messages,
         status=session_status(session, user_key=user_key),
-        data=interview_payload(user_key),
+        data={
+            **interview_payload(user_key),
+            "learned_weaknesses": learned_weaknesses,
+            "review_memory": review_memory,
+        },
     )

@@ -1,5 +1,7 @@
 import os
 import asyncio
+import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
@@ -10,13 +12,20 @@ from openai import AsyncOpenAI
 
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GEMINI_ANALYSIS_MODEL = "gemini-2.5-flash"
 DEFAULT_LLM_RETRY_DELAYS = (2, 5, 10)
 T = TypeVar("T")
 
 
 class ModelProvider(ABC):
     @abstractmethod
-    async def ask(self, instructions: str, prompt: str, max_output_tokens: int = 900) -> str:
+    async def ask(
+        self,
+        instructions: str,
+        prompt: str,
+        max_output_tokens: int = 900,
+        model: str | None = None,
+    ) -> str:
         pass
 
 
@@ -25,9 +34,15 @@ class OpenAIProvider(ModelProvider):
         self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
 
-    async def ask(self, instructions: str, prompt: str, max_output_tokens: int = 900) -> str:
+    async def ask(
+        self,
+        instructions: str,
+        prompt: str,
+        max_output_tokens: int = 900,
+        model: str | None = None,
+    ) -> str:
         response = await self.client.responses.create(
-            model=self.model,
+            model=model or self.model,
             instructions=instructions,
             input=prompt,
             max_output_tokens=max_output_tokens,
@@ -42,18 +57,26 @@ class GeminiProvider(ModelProvider):
         fallback_models = parse_csv_env("GEMINI_FALLBACK_MODELS")
         self.models = [self.model, *[model for model in fallback_models if model != self.model]]
 
-    async def ask(self, instructions: str, prompt: str, max_output_tokens: int = 900) -> str:
+    async def ask(
+        self,
+        instructions: str,
+        prompt: str,
+        max_output_tokens: int = 900,
+        model: str | None = None,
+    ) -> str:
         config = types.GenerateContentConfig(
             system_instruction=instructions,
             max_output_tokens=max_output_tokens,
         )
+        primary_model = model or self.model
+        models = [primary_model, *[fallback for fallback in self.models if fallback != primary_model]]
 
         last_error: Exception | None = None
-        for model in self.models:
+        for candidate_model in models:
             try:
                 response = await asyncio.to_thread(
                     self.client.models.generate_content,
-                    model=model,
+                    model=candidate_model,
                     contents=prompt,
                     config=config,
                 )
@@ -104,6 +127,26 @@ def is_retryable_llm_error(exc: Exception) -> bool:
     return any(signal in message for signal in retryable_signals)
 
 
+def parse_json_object(value: str) -> dict[str, object]:
+    cleaned = value.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if not match:
+            return {}
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
 async def run_with_retry(operation: Callable[[], Awaitable[T]]) -> T:
     delays = retry_delays()
     for attempt in range(len(delays) + 1):
@@ -130,9 +173,76 @@ def create_provider() -> ModelProvider:
 class JobisLLM:
     def __init__(self) -> None:
         self.provider = create_provider()
+        self.main_chat_model = os.getenv("JOBIS_MAIN_CHAT_MODEL") or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+        self.analysis_model = os.getenv("JOBIS_ANALYSIS_MODEL", DEFAULT_GEMINI_ANALYSIS_MODEL)
 
-    async def _ask(self, instructions: str, prompt: str, max_output_tokens: int = 900) -> str:
-        return await run_with_retry(lambda: self.provider.ask(instructions, prompt, max_output_tokens))
+    async def _ask(
+        self,
+        instructions: str,
+        prompt: str,
+        max_output_tokens: int = 900,
+        model: str | None = None,
+    ) -> str:
+        return await run_with_retry(lambda: self.provider.ask(instructions, prompt, max_output_tokens, model))
+
+    async def _ask_main_chat(self, instructions: str, prompt: str, max_output_tokens: int = 900) -> str:
+        return await self._ask(instructions, prompt, max_output_tokens, model=self.main_chat_model)
+
+    async def _ask_analysis(self, instructions: str, prompt: str, max_output_tokens: int = 900) -> str:
+        return await self._ask(instructions, prompt, max_output_tokens, model=self.analysis_model)
+
+    async def classify_agent_intent(self, message: str) -> dict[str, object]:
+        instructions = (
+            "너는 jobis 개인 취업 에이전트의 intent router다. "
+            "사용자 문장을 보고 허용된 action 중 하나만 고른다. "
+            "DB 저장, 면접 시작, 분석 실행은 직접 하지 않는다. "
+            "반드시 JSON 객체만 출력한다."
+        )
+        prompt = (
+            "허용 action:\n"
+            "- list_job_postings: 저장된 공고 목록을 보여달라는 요청\n"
+            "- select_job_posting: 특정 번호의 공고를 선택하는 요청\n"
+            "- save_job_posting: 공고 URL이나 본문을 저장/추가/등록하는 요청\n"
+            "- list_github_repositories: 저장된 GitHub 저장소 목록을 보여달라는 요청\n"
+            "- analyze_github_repository: GitHub 레포 URL을 분석/저장/추가/등록하는 요청\n"
+            "- get_github_analysis: 최근 GitHub 분석 결과나 요약을 보여달라는 요청\n"
+            "- save_profile: 프로필 내용을 저장/입력/수정하는 요청\n"
+            "- save_resume: 자소서, 자기소개서, 이력서 내용을 저장/입력/수정하는 요청\n"
+            "- get_context: 저장된 입력 자료, 프로필, 자소서, 컨텍스트를 보여달라는 요청\n"
+            "- start_interview: 면접을 시작하거나 진행해달라는 요청\n"
+            "- get_interview: 현재 면접 상태나 진행 중인 질문을 보여달라는 요청\n"
+            "- get_latest_review: 최근 리뷰, 회고, 피드백을 불러달라는 요청\n"
+            "- search_interview_history: 이전/지난/했던 면접에서 특정 주제의 질문, 답변, 피드백이 있었는지 찾는 요청\n"
+            "- get_status: 준비 상태, 진행 현황을 보여달라는 요청\n"
+            "- create_context_analysis: 저장된 프로필, 자소서, GitHub, 공고를 바탕으로 적합도/준비 포인트를 분석해달라는 요청\n"
+            "- create_question_plan: 공고와 GitHub를 바탕으로 면접 질문 후보를 만들어달라는 요청\n"
+            "- submit_interview_answer: 현재 면접 질문에 대한 사용자의 답변을 저장하는 요청\n"
+            "- next_interview_question: 다음 기본 면접 질문으로 넘어가라는 요청\n"
+            "- create_followup_question: 방금 답변에 대한 꼬리질문을 만들어달라는 요청\n"
+            "- create_another_question: 같은 분야의 추가질문이나 다른 질문을 만들어달라는 요청\n"
+            "- create_final_review: 전체 면접 리뷰나 평가를 생성해달라는 요청\n"
+            "- end_interview: 현재 면접을 종료하라는 요청\n"
+            "- unknown: 위 action으로 확신할 수 없는 요청\n\n"
+            "출력 JSON 형식:\n"
+            '{"action":"action_name","job_index":null,"job_text":"","github_url":"","github_indices":[],"question_count":null,"question_counts":{},"profile_text":"","resume_text":"","answer":"","confidence":0.0}\n\n'
+            "규칙:\n"
+            "- job_index는 '1번', '2번'처럼 명확한 번호가 있을 때만 숫자로 넣는다.\n"
+            "- '첫 번째', '두 번째'처럼 명확한 순서 표현도 job_index로 바꿔 넣는다.\n"
+            "- '방금 공고', '최근 공고', '마지막 공고'처럼 상대 표현이면 job_index는 null로 둔다. 서버가 최근 저장 공고를 찾는다.\n"
+            "- save_job_posting이면 URL 또는 공고 본문으로 보이는 내용을 job_text에 넣는다.\n"
+            "- analyze_github_repository이면 GitHub 레포 URL만 github_url에 넣는다.\n"
+            "- create_question_plan이면 GitHub 번호가 명확할 때 github_indices 배열에 넣는다.\n"
+            "- create_question_plan에서 '질문 5개'처럼 총 개수만 있으면 question_count에 넣고 question_counts는 비워도 된다.\n"
+            "- create_question_plan에서 유형별 개수가 명확하면 question_counts에 넣는다. 허용 유형은 CS 기본기, 언어, 기술스택, 프로젝트/GitHub, 프로젝트/자소서다.\n"
+            "- save_profile이면 프로필 본문만 profile_text에 넣는다.\n"
+            "- save_resume이면 자소서/자기소개서/이력서 본문만 resume_text에 넣는다.\n"
+            "- submit_interview_answer이면 사용자가 실제 답변으로 말한 부분만 answer에 넣는다.\n"
+            "- 확신이 낮으면 unknown을 고른다.\n"
+            "- JSON 외 설명은 절대 쓰지 않는다.\n\n"
+            f"사용자 문장: {message}"
+        )
+        raw = await self._ask_main_chat(instructions, prompt, max_output_tokens=180)
+        return parse_json_object(raw)
 
     def _question_type_rule(self, question_type: str | None) -> str:
         rules = {
@@ -222,7 +332,7 @@ class JobisLLM:
             "   - 면접 전 외워야 할 답이 아니라, 본인 코드 기준으로 설명 준비할 주제 3개\n\n"
             f"{github_context}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=2200)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=2200)
 
     async def summarize_github_changes(self, previous_summary: str, current_summary: str) -> str:
         instructions = (
@@ -243,7 +353,7 @@ class JobisLLM:
             "[새 분석]\n"
             f"{current_summary[:6000]}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=500)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=500)
 
     async def summarize_for_user(self, title: str, detail: str) -> str:
         instructions = (
@@ -265,7 +375,7 @@ class JobisLLM:
             "다음 단계: 사용자가 실행할 명령어 1개\n\n"
             f"{detail}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=700)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=700)
 
     async def summarize_job_posting(self, job_posting: str) -> str:
         instructions = (
@@ -297,7 +407,7 @@ class JobisLLM:
             "- 이 공고 기준으로 준비할 면접 포인트 2\n\n"
             f"{job_posting}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=900)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=900)
 
     async def analyze_context(self, context: str) -> str:
         instructions = (
@@ -338,7 +448,7 @@ class JobisLLM:
             "7. 면접관 주의점: 거짓 경험을 만들지 않기 위해 확인해야 할 점\n\n"
             f"{context}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=2200)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=2200)
 
     async def start_interview(self, context: str, question_type: str) -> str:
         question_type_rule = self._question_type_rule(question_type)
@@ -358,7 +468,7 @@ class JobisLLM:
             "출력은 질문 문장만 작성해라.\n\n"
             f"{context}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=500)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=500)
 
     async def generate_interview_questions(self, context: str, question_types: list[str] | None = None) -> str:
         question_types = question_types or [
@@ -393,7 +503,7 @@ class JobisLLM:
             f"{output_format}\n\n"
             f"{context}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=1400)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=1400)
 
     async def generate_bonus_question(
         self,
@@ -429,7 +539,7 @@ class JobisLLM:
             f"보너스 질문 방식: {mode_rule}\n"
             "출력은 질문 문장만 작성해라."
         )
-        return await self._ask(instructions, prompt, max_output_tokens=400)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=400)
 
     async def evaluate_full_interview(self, context: str, history: str) -> str:
         instructions = (
@@ -468,7 +578,7 @@ class JobisLLM:
             "약점 요약: 반복적으로 드러난 약점만 2~3개로 짧게 정리한다\n"
             "다음 준비: 바로 준비할 주제나 액션 2~3개. 번호 목록을 쓸 때는 각 번호를 새 줄에서 시작한다"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=1800)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=1800)
 
     async def evaluate_answer_and_next(
         self,
@@ -532,7 +642,7 @@ class JobisLLM:
             "피드백은 짧게 주되, 사용자가 바로 고칠 수 있는 근거는 반드시 포함한다.\n"
             f"{next_instruction}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=700)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=700)
 
     async def review_resume(self, context: str) -> str:
         instructions = (
@@ -549,7 +659,7 @@ class JobisLLM:
             "4. GitHub나 프로젝트 경험에서 추가하면 좋은 소재\n\n"
             f"{context}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=1200)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=1200)
 
     async def summarize_weaknesses(self, history: str) -> str:
         instructions = (
@@ -565,4 +675,4 @@ class JobisLLM:
             "3. 약점 주제: 근거와 다음 준비 방법\n\n"
             f"{history}"
         )
-        return await self._ask(instructions, prompt, max_output_tokens=700)
+        return await self._ask_analysis(instructions, prompt, max_output_tokens=700)
